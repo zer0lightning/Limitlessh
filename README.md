@@ -49,7 +49,7 @@ you     ──► :2200 sshd
 Keep an existing SSH session open until login on the new port is confirmed.
 
 ```bash
-wget https://raw.githubusercontent.com/<your-user>/limitlessh/main/install-limitlessh.sh
+wget https://raw.githubusercontent.com/zer0lightning/limitlessh/main/install-limitlessh.sh
 chmod +x install-limitlessh.sh
 less install-limitlessh.sh              # review before running as root
 ./install-limitlessh.sh --print-units   # optional: show generated files, no root
