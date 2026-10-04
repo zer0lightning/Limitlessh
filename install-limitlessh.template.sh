@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # Defaults (environment variables also work, flags override them)
 PORT="${PORT:-22}"                       # tarpit port
@@ -102,6 +102,7 @@ Examples:
 
 After installing:
   sudo limitlessh-report                    # report for the last 7 days
+  sudo limitlessh-report --live             # live sessions, auto-refresh (q to quit)
   sudo limitlessh-report --ip 203.0.113.7   # history of one IP
   sudo limitlessh-report --csv out.csv      # raw records with geolocation
   journalctl -u limitlessh -f               # service log (a summary every 10 min)
@@ -217,6 +218,9 @@ log-retention-days = $LOG_RETENTION_DAYS
 log-rate           = 200
 stats-file         = $STATE_DIR/stats.json
 stats-interval     = 60
+# Written only while 'limitlessh-report --live' is watching
+live-file          = $STATE_DIR/live.json
+live-max           = 2000
 EOF
 }
 
@@ -694,6 +698,7 @@ echo "  logs              : journalctl -u limitlessh -f"
 echo "  stats now         : sudo systemctl kill -s USR1 limitlessh"
 if (( CONN_LOG )); then
   echo "  report            : sudo limitlessh-report            (see --help)"
+  echo "  live view         : sudo limitlessh-report --live     (q to quit)"
   echo "  connection log    : $LOGS_DIR/connections.log  (kept $LOG_RETENTION_DAYS days)"
 fi
 if [[ -d "$BACKUP_DIR" ]]; then

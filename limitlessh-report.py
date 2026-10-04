@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-limitlessh-report - reports, raw-log export and IP geolocation for limitlessh.
+limitlessh-report - reports, live view, raw-log export and IP geolocation for limitlessh.
 
 Reads the connection log written by limitlessh (JSON lines, rotated and
 gzip-compressed) plus its stats file, and enriches IP addresses with country,
@@ -29,6 +29,7 @@ import mmap
 import os
 import re
 import shutil
+import stat
 import struct
 import sys
 import tempfile
@@ -36,11 +37,12 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 PROG = "limitlessh-report"
 
 DEFAULT_LOG = "/var/log/limitlessh/connections.log"
 DEFAULT_STATS = "/var/lib/limitlessh/stats.json"
+DEFAULT_LIVE = "/var/lib/limitlessh/live.json"
 DEFAULT_GEO_DIR = "/var/lib/limitlessh-geo"
 
 # Database file names we look for, in order of preference.
@@ -593,7 +595,8 @@ def log_files(log_path):
     rotated = sorted(glob.glob(glob.escape(base + "-") + "*.log.gz") +
                      glob.glob(glob.escape(base + "-") + "*.log"))
     files = rotated + ([log_path] if os.path.exists(log_path) else [])
-    return files
+    # The log directory belongs to the service user; don't follow links it may plant
+    return [f for f in files if not os.path.islink(f)]
 
 
 def _rotated_stamp(path):
@@ -830,14 +833,7 @@ def iso(ts):
 
 
 def load_live(path):
-    try:
-        with open(path, encoding="utf-8") as f:
-            if os.fstat(f.fileno()).st_size > 1048576:
-                return None
-            data = json.load(f)
-        return data if isinstance(data, dict) else None
-    except (OSError, ValueError):
-        return None
+    return read_json_file(path, 1048576)
 
 
 def new_ip_count(log_path, report, since):
@@ -857,6 +853,7 @@ def new_ip_count(log_path, report, since):
 # ---------------------------------------------------------------------------
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f  ‪-‮⁦-⁩]")
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def clean(text, width=None):
@@ -875,13 +872,70 @@ def csv_cell(value):
     return s
 
 
+class Style(object):
+    """ANSI colours. Applied only to text that has already been clean()ed."""
+    CODES = {"bold": "1", "dim": "2", "italic": "3", "under": "4",
+             "red": "31", "green": "32", "yellow": "33", "blue": "34", "magenta": "35", "cyan": "36",
+             "grey": "90", "bred": "91", "bgreen": "92", "byellow": "93", "bblue": "94",
+             "bmagenta": "95", "bcyan": "96", "white": "97", "inverse": "7"}
+
+    def __init__(self, enabled=False):
+        self.on = enabled
+
+    def __call__(self, text, *styles):
+        if not self.on or not styles:
+            return text
+        return "\x1b[%sm%s\x1b[0m" % (";".join(self.CODES[s] for s in styles), text)
+
+
+S = Style(False)
+
+RESULT_STYLE = {"closed": ("green",), "evicted": ("yellow",), "stalled": ("magenta",),
+                "expired": ("blue",), "shutdown": ("grey",),
+                "rejected-ip": ("red",), "rejected-net": ("bred",)}
+
+
+def color_mode(choice):
+    if choice == "always":
+        return True
+    if choice == "never" or os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty() and os.environ.get("TERM", "") not in ("", "dumb")
+
+
+def vlen(s):
+    return len(_ANSI.sub("", s))
+
+
+def clip(s, width):
+    """Cut a string to `width` visible characters, keeping colour codes intact."""
+    if vlen(s) <= width:
+        return s
+    out, seen, i = [], 0, 0
+    while i < len(s) and seen < width:
+        m = _ANSI.match(s, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        out.append(s[i])
+        seen += 1
+        i += 1
+    return "".join(out) + ("\x1b[0m" if S.on else "")
+
+
+def pad(s, width, align="l"):
+    gap = max(0, width - vlen(s))
+    return (" " * gap + s) if align == "r" else (s + " " * gap)
+
+
 def fmt_dur(seconds):
-    seconds = int(round(seconds))
+    seconds = int(round(max(0, seconds)))
     if seconds < 60:
         return "%ds" % seconds
     out = []
     for unit, size in (("y", 31536000), ("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
-        if seconds >= size:
+        if out or seconds >= size:  # largest unit, then the next one even if zero
             out.append("%d%s" % (seconds // size, unit))
             seconds %= size
         if len(out) == 2:
@@ -903,70 +957,112 @@ def fmt_bytes(n):
 def fmt_time(iso_text, local):
     if not iso_text:
         return "-"
-    dt = datetime.datetime.strptime(iso_text, TS_FORMAT).replace(tzinfo=datetime.timezone.utc)
+    try:
+        dt = datetime.datetime.strptime(iso_text, TS_FORMAT).replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return "-"
     if local:
         dt = dt.astimezone()
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
-def bar(value, maximum, width=30):
-    if maximum <= 0:
+def fmt_clock(ts, local):
+    dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+    if local:
+        dt = dt.astimezone()
+    return dt.strftime("%m-%d %H:%M" if time.time() - ts > 86400 else "%H:%M:%S")
+
+
+def dur_style(seconds, text):
+    if seconds >= 3600:
+        return S(text, "bgreen", "bold")
+    if seconds >= 600:
+        return S(text, "green")
+    if seconds < 30:
+        return S(text, "grey")
+    return text
+
+
+def bar(value, maximum, width=30, *styles):
+    if maximum <= 0 or width <= 0:
         return ""
     n = value / float(maximum) * width
     full = int(n)
-    return "█" * full + ("▌" if n - full >= 0.5 else "")
+    text = "█" * full + ("▌" if n - full >= 0.5 else "")
+    if not text and value > 0:
+        text = "▏"
+    return S(text, *styles) if styles else text
 
 
-def table(headers, rows, aligns):
-    widths = [len(h) for h in headers]
+def gauge(value, maximum, width):
+    frac = 0.0 if maximum <= 0 else min(1.0, value / float(maximum))
+    full = int(round(frac * width))
+    colour = "green" if frac < 0.6 else "yellow" if frac < 0.9 else "red"
+    return S("█" * full, colour) + S("░" * (width - full), "grey")
+
+
+def heading(title, extra=""):
+    line = S("▍", "bcyan") + S(title, "bold", "bcyan")
+    return line + ("  " + S(extra, "grey") if extra else "")
+
+
+def table(headers, rows, aligns, indent="  "):
+    widths = [vlen(h) for h in headers]
     for row in rows:
         for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(cell))
-    def line(cells):
-        return "  " + "  ".join(c.rjust(w) if a == "r" else c.ljust(w)
-                                for c, w, a in zip(cells, widths, aligns)).rstrip()
-    out = [line(headers), "  " + "  ".join("─" * w for w in widths)]
+            widths[i] = max(widths[i], vlen(cell))
+
+    def line(cells, head=False):
+        parts = [pad(S(c, "bold") if head else c, w, a) for c, w, a in zip(cells, widths, aligns)]
+        return (indent + "  ".join(parts)).rstrip()
+    out = [line(headers, True), indent + S("  ".join("─" * w for w in widths), "grey")]
     out += [line(r) for r in rows]
     return "\n".join(out)
 
 
 def geo_label(g):
     if g.get("country") == "(private/reserved)":
-        return "private"
+        return S("private", "grey")
     parts = [p for p in (g.get("city"), g.get("country_code") or g.get("country")) if p]
-    return ", ".join(parts) if parts else "-"
+    return S(clean(", ".join(parts), 28), "cyan") if parts else S("-", "grey")
 
 
-def asn_label(g):
+def asn_label(g, width=34):
     if g.get("asn") == "" and not g.get("org"):
-        return "-"
-    return ("AS%s " % g["asn"] if g.get("asn") != "" else "") + (g.get("org") or "")
+        return S("-", "grey")
+    num = ("AS%s " % g["asn"]) if g.get("asn") != "" else ""
+    return S(num, "grey") + clean(g.get("org") or "", max(4, width - len(num)))
+
+
+def ip_text(ip):
+    return S(clean(ip, 39), "byellow")
+
+
+def big(n):
+    return S(n, "bold", "white")
 
 
 def render_text(d, local, geo_available, attribution):
     out = []
     w = out.append
     since = fmt_time(d["period"]["since"], local) if d["period"]["since"] else "start of logs"
-    w("limitlessh report   %s → %s (%s)" % (since, fmt_time(d["period"]["until"], local),
-                                          "local time" if local else "UTC"))
+    w(S(" limitlessh report ", "bold", "inverse") + "  " +
+      S("%s → %s (%s)" % (since, fmt_time(d["period"]["until"], local), "local time" if local else "UTC"), "grey"))
     live = d.get("live")
     if live:
         life = live.get("lifetime", {}) if isinstance(live.get("lifetime"), dict) else {}
         lc = life.get("counters", {}) if isinstance(life.get("counters"), dict) else {}
-        def num(x):
-            return x if isinstance(x, (int, float)) and not isinstance(x, bool) else 0
         uptime = num(live.get("updated_ts")) - num(live.get("started_ts"))
-        w("Live      %s active of %s · up %s · stats updated %s" % (
-            fmt_int(num(live.get("active"))), fmt_int(num(live.get("max_clients"))),
-            fmt_dur(max(0, uptime)), fmt_time(clean(live.get("updated", "")), local) if live.get("updated") else "-"))
-        w("Lifetime  since %s: %s trapped · %s attacker time · peak %s active (%s)" % (
-            fmt_time(clean(life.get("since", "")), local) if life.get("since") else "-",
-            fmt_int(num(lc.get("accepted"))), fmt_dur(num(lc.get("wasted")) + num(live.get("active_time"))),
-            fmt_int(num(life.get("peak_active"))),
-            fmt_time(clean(life.get("peak", "")), local) if life.get("peak") else "-"))
+        w("%s %s active of %s · up %s · stats updated %s" % (
+            S("Live    ", "bold"), big(fmt_int(num(live.get("active")))), fmt_int(num(live.get("max_clients"))),
+            fmt_dur(max(0, uptime)), fmt_time(clean(live.get("updated", "")), local)))
+        w("%s since %s: %s trapped · %s attacker time · peak %s active (%s)" % (
+            S("Lifetime", "bold"), fmt_time(clean(life.get("since", "")), local),
+            big(fmt_int(num(lc.get("accepted")))), big(fmt_dur(num(lc.get("wasted")) + num(live.get("active_time")))),
+            fmt_int(num(life.get("peak_active"))), fmt_time(clean(life.get("peak", "")), local)))
     o = d["overview"]
     w("")
-    w("OVERVIEW")
+    w(heading("OVERVIEW"))
     pairs = [
         ("Connections trapped", fmt_int(o["trapped"]), "Unique IPs", fmt_int(o["unique_ips"])),
         ("Rejected by limits", fmt_int(o["rejected"]), "Unique networks", fmt_int(o["unique_networks"])),
@@ -975,10 +1071,10 @@ def render_text(d, local, geo_available, attribution):
         ("Banner data sent", fmt_bytes(o["bytes_sent"]), "Service starts", fmt_int(o["service_starts"])),
     ]
     for a, b, c, e in pairs:
-        w("  %-22s %12s     %-16s %12s" % (a, b, c, e))
+        w("  %s %s     %s %s" % (pad(a, 22), pad(big(b), 12, "r"), pad(c, 16), pad(big(e), 12, "r")))
     if o["suppressed_log_lines"] or o["invalid_log_lines"]:
-        w("  Note: %s events not logged (rate cap), %s unreadable log lines skipped" % (
-            fmt_int(o["suppressed_log_lines"]), fmt_int(o["invalid_log_lines"])))
+        w("  " + S("Note: %s events not logged (rate cap), %s unreadable log lines skipped" % (
+            fmt_int(o["suppressed_log_lines"]), fmt_int(o["invalid_log_lines"])), "yellow"))
     if not o["trapped"] and not o["rejected"]:
         w("")
         w("No connections in this period.")
@@ -986,7 +1082,7 @@ def render_text(d, local, geo_available, attribution):
 
     total = sum(d["results"].values()) or 1
     w("")
-    w("HOW CONNECTIONS ENDED")
+    w(heading("HOW CONNECTIONS ENDED"))
     labels = {"closed": "client gave up", "evicted": "evicted (tarpit full)", "stalled": "stopped reading",
               "expired": "max lifetime reached", "shutdown": "service stopped",
               "rejected-ip": "rejected: per-IP limit", "rejected-net": "rejected: per-network limit"}
@@ -994,100 +1090,371 @@ def render_text(d, local, geo_available, attribution):
     for key in RESULTS:
         n = d["results"].get(key, 0)
         if n:
-            w("  %-28s %10s %6.1f%%  %s" % (labels[key], fmt_int(n), 100.0 * n / total, bar(n, biggest, 25)))
+            w("  %s %s %6.1f%%  %s" % (pad(S(labels[key], *RESULT_STYLE[key]), 28), pad(fmt_int(n), 10, "r"),
+                                     100.0 * n / total, bar(n, biggest, 25, *RESULT_STYLE[key])))
 
     w("")
-    w("TIME HELD (trapped connections)")
+    w(heading("TIME HELD", "trapped connections"))
     biggest = max(d["hold_time"].values()) or 1
-    for label, n in d["hold_time"].items():
-        w("  %-8s %10s %6.1f%%  %s" % (label, fmt_int(n), 100.0 * n / max(1, o["trapped"]), bar(n, biggest, 30)))
+    hold_colours = ("grey", "grey", "cyan", "cyan", "green", "bgreen", "bgreen")
+    for (label, n), colour in zip(d["hold_time"].items(), hold_colours):
+        w("  %-8s %10s %6.1f%%  %s" % (label, fmt_int(n), 100.0 * n / max(1, o["trapped"]), bar(n, biggest, 30, colour)))
 
     def ip_rows(rows):
-        return [[clean(r["ip"], 39), fmt_int(r["conns"]), fmt_int(r["rejected"]), fmt_dur(r["time"]),
-                 clean(geo_label(r), 28), clean(asn_label(r), 34)] for r in rows]
+        return [[ip_text(r["ip"]), fmt_int(r["conns"]), S(fmt_int(r["rejected"]), "red") if r["rejected"] else "0",
+                 dur_style(r["time"], fmt_dur(r["time"])), geo_label(r), asn_label(r)] for r in rows]
 
     w("")
-    w("TOP IPs BY ATTACKER TIME")
-    w(table(["IP", "Trapped", "Rejected", "Time", "Location", "Network"],
-            ip_rows(d["top_ips_by_time"]), "lrrrll"))
+    w(heading("TOP IPs BY ATTACKER TIME"))
+    w(table(["IP", "Trapped", "Rejected", "Time", "Location", "Network"], ip_rows(d["top_ips_by_time"]), "lrrrll"))
     w("")
-    w("TOP IPs BY CONNECTIONS")
-    w(table(["IP", "Trapped", "Rejected", "Time", "Location", "Network"],
-            ip_rows(d["top_ips_by_connections"]), "lrrrll"))
+    w(heading("TOP IPs BY CONNECTIONS"))
+    w(table(["IP", "Trapped", "Rejected", "Time", "Location", "Network"], ip_rows(d["top_ips_by_connections"]), "lrrrll"))
 
     if geo_available:
         w("")
-        w("TOP COUNTRIES")
+        w(heading("TOP COUNTRIES"))
         w(table(["Country", "IPs", "Trapped", "Rejected", "Time"],
-                [[clean(("%s %s" % (r["country_code"], r["country"])).strip() or "unknown", 34),
+                [[S(clean(("%s %s" % (r["country_code"], r["country"])).strip() or "unknown", 34), "cyan"),
                   fmt_int(r["ips"]), fmt_int(r["conns"]), fmt_int(r["rejected"]), fmt_dur(r["time"])]
                  for r in d["top_countries"]], "lrrrr"))
         w("")
-        w("TOP NETWORKS (ASN / ISP)")
+        w(heading("TOP NETWORKS", "ASN / ISP"))
         w(table(["ASN", "Organisation", "IPs", "Trapped", "Rejected", "Time"],
-                [["AS%s" % r["asn"] if r["asn"] != "" else "-", clean(r["org"] or "unknown", 40),
+                [[S("AS%s" % r["asn"], "grey") if r["asn"] != "" else S("-", "grey"),
+                  clean(r["org"] or "unknown", 40),
                   fmt_int(r["ips"]), fmt_int(r["conns"]), fmt_int(r["rejected"]), fmt_dur(r["time"])]
                  for r in d["top_asns"]], "llrrrr"))
 
     w("")
-    w("LONGEST SESSIONS")
+    w(heading("LONGEST SESSIONS"))
     w(table(["Started", "IP", "Held", "Ended", "Location", "Network"],
-            [[fmt_time(r["start"], local), clean(r["ip"], 39), fmt_dur(r["duration"]), r["result"],
-              clean(geo_label(r), 28), clean(asn_label(r), 30)] for r in d["longest_sessions"]], "llrlll"))
+            [[S(fmt_time(r["start"], local), "grey"), ip_text(r["ip"]), dur_style(r["duration"], fmt_dur(r["duration"])),
+              S(r["result"], *RESULT_STYLE.get(r["result"], ())), geo_label(r), asn_label(r, 30)]
+             for r in d["longest_sessions"]], "llrlll"))
 
     days = list(d["daily"].items())[-14:]
     if days:
         w("")
-        w("DAILY%s" % (" (last 14 days shown)" if len(d["daily"]) > 14 else ""))
+        w(heading("DAILY", "last 14 days shown" if len(d["daily"]) > 14 else ""))
         biggest = max(v["trapped"] + v["rejected"] for _, v in days) or 1
         w(table(["Date", "Trapped", "Rejected", "IPs", "Time", ""],
                 [[day, fmt_int(v["trapped"]), fmt_int(v["rejected"]), fmt_int(v["ips"]), fmt_dur(v["time"]),
-                  bar(v["trapped"] + v["rejected"], biggest, 25)] for day, v in days], "lrrrrl"))
+                  bar(v["trapped"], biggest, 25, "cyan") + bar(v["rejected"], biggest, 25, "red")]
+                 for day, v in days], "lrrrrl"))
 
     w("")
-    w("HOUR OF DAY (%s, all connection attempts)" % ("local time" if local else "UTC"))
+    w(heading("HOUR OF DAY", "%s, all connection attempts" % ("local time" if local else "UTC")))
     hours = d["hour_of_day"]
     biggest = max(hours.values()) or 1
     for h in range(24):
-        w("  %02d:00 %9s  %s" % (h, fmt_int(hours[h]), bar(hours[h], biggest, 40)))
+        frac = hours[h] / float(biggest)
+        colour = "bblue" if frac > 0.8 else "blue" if frac > 0.4 else "grey"
+        w("  %02d:00 %9s  %s" % (h, fmt_int(hours[h]), bar(hours[h], biggest, 40, colour)))
 
     w("")
     if geo_available:
         src = ", ".join("%s (built %s)" % (f["file"], f["built"]) for f in d["geo_sources"])
-        w("Geolocation: %s" % src)
+        w(S("Geolocation: %s" % src, "grey"))
         if attribution:
-            w("IP geolocation by DB-IP (https://db-ip.com), licensed CC BY 4.0.")
+            w(S("IP geolocation by DB-IP (https://db-ip.com), licensed CC BY 4.0.", "grey"))
     else:
-        w("Geolocation: not available. Run 'sudo limitlessh-report --update-geo' to download DB-IP Lite.")
+        w(S("Geolocation: not available. Run 'sudo limitlessh-report --update-geo' to download DB-IP Lite.", "yellow"))
     return "\n".join(out)
 
 
-def render_ip(ip_text, records, geo, local, limit):
-    g = geo.lookup(ip_text)
+def render_ip(ip_str, records, geo, local, limit):
+    g = geo.lookup(ip_str)
     trapped = [r for r in records if not r["result"].startswith("rejected")]
     rejected = len(records) - len(trapped)
     total = sum(r["dur"] for r in trapped)
-    out = ["IP %s" % clean(ip_text)]
+    out = [S(" IP ", "bold", "inverse") + " " + ip_text(ip_str)]
     if geo.available:
-        out.append("  Location   %s" % clean(", ".join(p for p in (g["city"], g["region"], g["country"]) if p) or "-"))
+        out.append("  Location   %s" % S(clean(", ".join(p for p in (g["city"], g["region"], g["country"]) if p) or "-"), "cyan"))
         if g["latitude"] != "":
-            out.append("  Coords     %s, %s (approximate)" % (g["latitude"], g["longitude"]))
-        out.append("  Network    %s" % clean(asn_label(g)))
+            out.append("  Coords     %s, %s %s" % (g["latitude"], g["longitude"], S("(approximate)", "grey")))
+        out.append("  Network    %s" % asn_label(g, 60))
     if not records:
         out.append("  No log entries for this IP in the period.")
         return "\n".join(out)
     out.append("  First seen %s" % fmt_time(iso(records[0]["t"]), local))
     out.append("  Last seen  %s" % fmt_time(iso(records[-1]["t"]), local))
     out.append("  Trapped    %s connections, %s total, longest %s" % (
-        fmt_int(len(trapped)), fmt_dur(total), fmt_dur(max([r["dur"] for r in trapped] or [0]))))
-    out.append("  Rejected   %s" % fmt_int(rejected))
+        big(fmt_int(len(trapped))), big(fmt_dur(total)), fmt_dur(max([r["dur"] for r in trapped] or [0]))))
+    out.append("  Rejected   %s" % (S(fmt_int(rejected), "red") if rejected else "0"))
     out.append("")
     shown = records[-limit:]
-    out.append("Most recent %d events:" % len(shown))
+    out.append(heading("Most recent %d events" % len(shown)))
     out.append(table(["Started", "Held", "Bytes", "Result"],
-                     [[fmt_time(iso(r["t"]), local), fmt_dur(r["dur"]), fmt_int(r["bytes"]), r["result"]]
+                     [[S(fmt_time(iso(r["t"]), local), "grey"), dur_style(r["dur"], fmt_dur(r["dur"])),
+                       fmt_int(r["bytes"]), S(r["result"], *RESULT_STYLE.get(r["result"], ()))]
                       for r in shown], "lrrl"))
     return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Live view
+# ---------------------------------------------------------------------------
+
+def num(v, default=0):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else default
+
+
+def touch_request(path):
+    """Ask limitlessh for live snapshots by touching LIVE-FILE.request.
+
+    The directory belongs to the service's throwaway user and we run as root,
+    so refuse symlinks (O_NOFOLLOW), FIFOs and other non-regular files, and
+    files with extra hard links: a compromised service must not be able to
+    make root create or touch files elsewhere.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as e:
+        if e.errno == 13:
+            raise ReportError("cannot write %s: permission denied (try sudo)" % path)
+        raise ReportError("refusing to use %s: %s" % (path, e.strerror or e))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise ReportError("refusing to use %s: not a plain file" % path)
+        os.utime(fd)
+    finally:
+        os.close(fd)
+
+
+def read_json_file(path, limit):
+    """Read a JSON file without following symlinks; None if missing or unusable."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            return None
+        data = f.read(limit + 1)
+    if len(data) > limit:
+        return None
+    try:
+        value = json.loads(data.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _valid_ip(v):
+    try:
+        return str(ipaddress.ip_address(str(v)))
+    except ValueError:
+        return None
+
+
+def parse_live(raw):
+    """Validate a live snapshot; everything in it is treated as untrusted."""
+    if not raw:
+        return None
+    snap = {k: num(raw.get(k)) for k in ("updated_ts", "started_ts", "active", "networks", "max_clients",
+                                         "per_ip", "per_net", "delay", "peak_window", "active_time",
+                                         "accepts_per_min", "rejects_per_min", "lifetime_accepted",
+                                         "lifetime_wasted", "sessions_truncated")}
+    sc = raw.get("session", {}).get("counters", {}) if isinstance(raw.get("session"), dict) else {}
+    snap["counters"] = {k: num(sc.get(k)) for k in ("accepted", "rejected_ip", "rejected_net", "evicted",
+                                                     "stalled", "expired", "closed", "wasted")} \
+        if isinstance(sc, dict) else {}
+    sessions = []
+    for s in (raw.get("sessions") or [])[:100000] if isinstance(raw.get("sessions"), list) else []:
+        if isinstance(s, dict):
+            ip = _valid_ip(s.get("ip"))
+            if ip:
+                sessions.append({"ip": ip, "start_ts": num(s.get("start_ts")), "bytes": int(num(s.get("bytes")))})
+    snap["sessions"] = sessions
+    recent = []
+    for e in (raw.get("recent") or [])[:1000] if isinstance(raw.get("recent"), list) else []:
+        if isinstance(e, dict) and e.get("result") in RESULTS:
+            ip = _valid_ip(e.get("ip"))
+            if ip:
+                recent.append({"ts": num(e.get("ts")), "ip": ip, "result": e["result"],
+                               "dur": num(e.get("dur")), "bytes": int(num(e.get("bytes")))})
+    snap["recent"] = recent
+    top = []
+    for item in (raw.get("top_active_ips") or [])[:100] if isinstance(raw.get("top_active_ips"), list) else []:
+        if isinstance(item, list) and len(item) == 2:
+            ip = _valid_ip(item[0])
+            if ip:
+                top.append((ip, int(num(item[1]))))
+    snap["top"] = top
+    return snap
+
+
+def side_by_side(left, right, left_width, gap=4):
+    rows = max(len(left), len(right))
+    left = left + [""] * (rows - len(left))
+    right = right + [""] * (rows - len(right))
+    return [pad(clip(a, left_width), left_width) + " " * gap + b for a, b in zip(left, right)]
+
+
+def render_live(snap, geo, local, width, height, interval, stale_reason=None):
+    now = time.time()
+    lines = []
+    w = lines.append
+    title = S(" limitlessh live ", "bold", "inverse")
+    if stale_reason:
+        status = S("● " + stale_reason, "byellow")
+    else:
+        status = S("●", "bgreen") + S(" updated %s" % fmt_clock(snap["updated_ts"], local), "grey")
+    right = S(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "  ·  every %gs  ·  q quit" % interval, "grey")
+    w(title + "  " + status + " " * max(1, width - vlen(title) - vlen(status) - vlen(right) - 2) + right)
+    if snap is None:
+        w("")
+        w(S("  Waiting for data from limitlessh…", "yellow"))
+        w(S("  Check that the service is running and that live-file is set in /etc/limitlessh/limitlessh.conf.", "grey"))
+        return "\n".join(lines)
+
+    gwidth = max(10, min(40, width - 60))
+    active, cap = int(snap["active"]), int(snap["max_clients"])
+    pct = 100.0 * active / cap if cap else 0
+    w("")
+    w("  %s %s / %s  %s %s     %s %s" % (S("ACTIVE   ", "bold"), big(fmt_int(active)), fmt_int(cap),
+                                        gauge(active, cap, gwidth), S("%3.0f%%" % pct, "bold"),
+                                        S("networks", "grey"), big(fmt_int(snap["networks"]))))
+    w("  %s %s trapped   %s rejected   %s" % (
+        S("PER MIN  ", "bold"), S("+" + fmt_int(snap["accepts_per_min"]), "bgreen", "bold"),
+        S("−" + fmt_int(snap["rejects_per_min"]), "bred", "bold"),
+        S("(limits: %d per IP, %d per network)" % (snap["per_ip"], snap["per_net"]), "grey")))
+    held_now = sum(max(0.0, now - s["start_ts"]) for s in snap["sessions"]) if snap["sessions"] else snap["active_time"]
+    w("  %s %s held right now   %s this run   %s lifetime   %s" % (
+        S("ATTACKER ", "bold"), S(fmt_dur(held_now), "bgreen", "bold"),
+        big(fmt_dur(snap["counters"].get("wasted", 0) + held_now)),
+        big(fmt_dur(snap["lifetime_wasted"] + held_now)),
+        S("up %s" % fmt_dur(now - snap["started_ts"]) if snap["started_ts"] else "", "grey")))
+    c = snap["counters"]
+    w("  %s %s trapped · %s closed · %s evicted · %s stalled · %s rejected" % (
+        S("THIS RUN ", "bold"), big(fmt_int(c.get("accepted", 0))), S(fmt_int(c.get("closed", 0)), "green"),
+        S(fmt_int(c.get("evicted", 0)), "yellow"), S(fmt_int(c.get("stalled", 0)), "magenta"),
+        S(fmt_int(c.get("rejected_ip", 0) + c.get("rejected_net", 0)), "red")))
+
+    # Space: header (6) + blank/heading/table header (3 per section) + footer (1)
+    free = max(8, height - len(lines) - 2)
+    lower_rows = max(4, min(12, free // 3))
+    session_rows = max(3, free - lower_rows - 6)
+
+    sessions = sorted(snap["sessions"], key=lambda s: s["start_ts"])[:session_rows]
+    w("")
+    shown = "showing %d of %s" % (len(sessions), fmt_int(active))
+    if snap["sessions_truncated"]:
+        shown += " (snapshot capped)"
+    w(heading("CURRENT SESSIONS", "longest held first · " + shown))
+    rows = []
+    for i, s in enumerate(sessions, 1):
+        held = max(0.0, now - s["start_ts"])
+        g = geo.lookup(s["ip"])
+        rows.append([S(str(i), "grey"), ip_text(s["ip"]), dur_style(held, fmt_dur(held)),
+                     S(fmt_clock(s["start_ts"], local), "grey"), fmt_int(s["bytes"]), geo_label(g),
+                     asn_label(g, max(10, width - 100))])
+    if rows:
+        lines.extend(clip(x, width) for x in table(["#", "IP", "Held", "Since", "Bytes", "Location", "Network"],
+                                                   rows, "rlrlrll").split("\n"))
+    else:
+        w(S("  No clients trapped right now.", "grey"))
+
+    top_rows = []
+    biggest = max([n for _, n in snap["top"]] or [1])
+    for ip, n in snap["top"][:lower_rows]:
+        g = geo.lookup(ip)
+        top_rows.append([ip_text(ip), pad(str(n), 3, "r") + " " + bar(n, biggest, 8, "cyan"), geo_label(g)])
+    top_block = [heading("TOP ACTIVE SOURCES")] + (
+        table(["IP", "Sessions", "Location"], top_rows, "lll").split("\n") if top_rows else [S("  none", "grey")])
+
+    recent_rows = []
+    for e in reversed(snap["recent"][-lower_rows:]):
+        recent_rows.append([S(fmt_clock(e["ts"], local), "grey"), ip_text(e["ip"]),
+                            S(e["result"], *RESULT_STYLE[e["result"]]),
+                            dur_style(e["dur"], fmt_dur(e["dur"])) if not e["result"].startswith("rejected") else S("-", "grey")])
+    recent_block = [heading("RECENT EVENTS", "newest first")] + (
+        table(["Time", "IP", "Result", "Held"], recent_rows, "lllr").split("\n") if recent_rows else [S("  none yet", "grey")])
+
+    w("")
+    left_width = max(vlen(x) for x in top_block)
+    if width >= left_width + 4 + max(vlen(x) for x in recent_block):
+        lines.extend(side_by_side(top_block, recent_block, left_width))
+    else:
+        lines.extend(top_block)
+        w("")
+        lines.extend(recent_block)
+    return "\n".join(clip(x, width) for x in lines[:max(1, height - 1)])
+
+
+class Terminal(object):
+    """Full-screen mode with cbreak input; restored on exit, even after errors."""
+
+    def __init__(self):
+        self.fd = None
+        self.saved = None
+
+    def __enter__(self):
+        sys.stdout.write("\x1b[?1049h\x1b[?25l")  # alternate screen, hide cursor
+        sys.stdout.flush()
+        if sys.stdin.isatty():
+            import termios
+            import tty
+            self.fd = sys.stdin.fileno()
+            self.saved = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, *exc):
+        if self.saved is not None:
+            import termios
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+        sys.stdout.write("\x1b[0m\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
+
+    def wait_key(self, timeout):
+        """Return a pressed key or None after timeout."""
+        if self.fd is None:
+            time.sleep(timeout)
+            return None
+        import select
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        if ready:
+            return os.read(self.fd, 1).decode("ascii", "ignore")
+        return None
+
+
+def live_loop(live_path, geo, local, interval, once):
+    request = live_path + ".request"
+
+    def frame():
+        touch_request(request)
+        snap = parse_live(read_json_file(live_path, 16 * 1048576))
+        stale = None
+        if snap is None:
+            stale = "no live data yet"
+        elif time.time() - snap["updated_ts"] > max(5.0, interval * 3):
+            stale = "data is %s old (service stopped?)" % fmt_dur(time.time() - snap["updated_ts"])
+        return snap, stale
+
+    if once:
+        snap, stale = frame()
+        if snap is None:
+            time.sleep(1.5)  # first request: give the service a moment to write
+            snap, stale = frame()
+        size = shutil.get_terminal_size((120, 50))
+        print(render_live(snap, geo, local, size.columns, 10 ** 6, interval, stale))
+        return
+    with Terminal() as term:
+        while True:
+            snap, stale = frame()
+            size = shutil.get_terminal_size((120, 40))
+            screen = render_live(snap, geo, local, size.columns, size.lines, interval, stale)
+            sys.stdout.write("\x1b[H" + screen.replace("\n", "\x1b[K\n") + "\x1b[K\x1b[J")
+            sys.stdout.flush()
+            key = term.wait_key(interval)
+            if key in ("q", "Q", "\x1b"):
+                return
 
 
 # ---------------------------------------------------------------------------
@@ -1097,9 +1464,10 @@ def render_ip(ip_text, records, geo, local, limit):
 def parse_args(argv):
     p = argparse.ArgumentParser(
         prog=PROG,
-        description="Reports, raw-log export and IP geolocation for limitlessh %s." % VERSION,
+        description="Reports, live view, raw-log export and IP geolocation for limitlessh %s." % VERSION,
         epilog="Examples:\n"
                "  limitlessh-report                     last 7 days\n"
+               "  limitlessh-report --live              live sessions, refreshes every 2s (q to quit)\n"
                "  limitlessh-report --since 24h --top 20\n"
                "  limitlessh-report --since all --json > report.json\n"
                "  limitlessh-report --ip 203.0.113.7\n"
@@ -1111,19 +1479,25 @@ def parse_args(argv):
     p.add_argument("--until", default="", help="end of period (default: now)")
     p.add_argument("--top", type=int, default=10, help="rows in top lists (default: 10)")
     p.add_argument("--utc", action="store_true", help="show times in UTC instead of local time")
+    p.add_argument("--color", choices=("auto", "always", "never"), default="auto",
+                   help="colour output (default: auto; NO_COLOR disables)")
     out = p.add_mutually_exclusive_group()
+    out.add_argument("--live", action="store_true", help="live view of current sessions, auto-refreshing")
     out.add_argument("--json", action="store_true", help="print the report as JSON")
     out.add_argument("--csv", metavar="FILE", help="export enriched raw records as CSV ('-' for stdout)")
     out.add_argument("--jsonl", metavar="FILE", help="export enriched raw records as JSON lines ('-' for stdout)")
     out.add_argument("--ip", metavar="ADDRESS", help="show details and history for one IP")
     out.add_argument("--lookup", nargs="+", metavar="ADDRESS", help="geolocate addresses and exit")
     out.add_argument("--update-geo", action="store_true", help="download or refresh DB-IP Lite databases")
+    p.add_argument("--interval", type=float, default=2.0, help="refresh interval for --live in seconds (default: 2)")
+    p.add_argument("--once", action="store_true", help="with --live: print one frame and exit")
     p.add_argument("--limit", type=int, default=50, help="events shown with --ip (default: 50)")
     p.add_argument("--no-geo", action="store_true", help="skip geolocation")
     p.add_argument("--geo-edition", choices=("city", "country"), default="city",
                    help="DB-IP edition for --update-geo: city (~250 MB) or country (~10 MB) (default: city)")
     p.add_argument("--log", default=DEFAULT_LOG, help="connection log (default: %s)" % DEFAULT_LOG)
     p.add_argument("--stats", default=DEFAULT_STATS, help="stats file (default: %s)" % DEFAULT_STATS)
+    p.add_argument("--live-file", default=DEFAULT_LIVE, help="live snapshot file (default: %s)" % DEFAULT_LIVE)
     p.add_argument("--geo-dir", default=DEFAULT_GEO_DIR, help="geolocation databases (default: %s)" % DEFAULT_GEO_DIR)
     p.add_argument("-q", "--quiet", action="store_true", help="less output from --update-geo")
     p.add_argument("-V", "--version", action="version", version="%s %s" % (PROG, VERSION))
@@ -1132,6 +1506,8 @@ def parse_args(argv):
         p.error("--top must be between 1 and 1000")
     if not 1 <= args.limit <= 100000:
         p.error("--limit must be between 1 and 100000")
+    if not 0.5 <= args.interval <= 3600:
+        p.error("--interval must be between 0.5 and 3600 seconds")
     return args
 
 
@@ -1143,7 +1519,9 @@ def open_output(path):
 
 
 def main(argv=None):
+    global S
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    S = Style(color_mode(args.color))
     try:
         if args.update_geo:
             update_geo(args.geo_dir, args.geo_edition, quiet=args.quiet)
@@ -1151,6 +1529,12 @@ def main(argv=None):
 
         geo = NoGeo() if args.no_geo else Geo(args.geo_dir)
         local = not args.utc
+
+        if args.live:
+            if not sys.stdout.isatty():
+                args.once = True
+            live_loop(args.live_file, geo, local, args.interval, args.once)
+            return 0
 
         if args.lookup:
             rows = []
@@ -1160,8 +1544,8 @@ def main(argv=None):
                 except ValueError:
                     raise ReportError("not an IP address: %r" % a)
                 g = geo.lookup(ip)
-                rows.append([ip, clean(", ".join(p for p in (g["city"], g["region"], g["country"]) if p) or "-", 48),
-                             clean(asn_label(g), 44)])
+                place = clean(", ".join(p for p in (g["city"], g["region"], g["country"]) if p) or "-", 48)
+                rows.append([ip_text(ip), S(place, "cyan"), asn_label(g, 44)])
             print(table(["IP", "Location", "Network"], rows, "lll"))
             if not geo.available:
                 print("\nNo geolocation databases found in %s; run --update-geo." % args.geo_dir)
@@ -1226,6 +1610,8 @@ def main(argv=None):
     except PermissionError as e:
         print("%s: %s (try sudo)" % (PROG, e), file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        return 130
     except BrokenPipeError:
         return 0
 

@@ -18,7 +18,7 @@ you     ──► :2200 sshd
 | Vanished client | held until TCP timeout (~15 min) | freed via `TCP_USER_TIMEOUT` |
 | Max hold time | none | optional `max-lifetime` |
 | Logging | one line per connect/disconnect | summary every 10 min; rotated, rate-capped JSON connection log |
-| Reports | none | `limitlessh-report`: top IPs, countries, ASNs/ISPs, durations, daily/hourly activity, CSV/JSON export |
+| Reports | none | `limitlessh-report`: top IPs, countries, ASNs/ISPs, durations, daily/hourly activity, CSV/JSON export; `--live` auto-refreshing view of current sessions |
 | Geolocation | none | country, region, city, ASN, organisation (offline, DB-IP Lite or MaxMind GeoLite2) |
 | Port 22 binding | needs `CAP_NET_BIND_SERVICE` | systemd socket activation, no capabilities |
 | Network access | full | none (`PrivateNetwork=yes`) |
@@ -49,7 +49,7 @@ you     ──► :2200 sshd
 Keep an existing SSH session open until login on the new port is confirmed.
 
 ```bash
-wget https://raw.githubusercontent.com/zer0lightning/limitlessh/main/install-limitlessh.sh
+wget https://raw.githubusercontent.com/<your-user>/limitlessh/main/install-limitlessh.sh
 chmod +x install-limitlessh.sh
 less install-limitlessh.sh              # review before running as root
 ./install-limitlessh.sh --print-units   # optional: show generated files, no root
@@ -64,6 +64,7 @@ Then, from a new terminal:
 ssh -p 2200 user@server
 journalctl -u limitlessh -f
 sudo limitlessh-report          # once some connections have been logged
+sudo limitlessh-report --live   # current sessions, refreshes every 2 s (q to quit)
 ```
 
 Open the new SSH port in any cloud firewall or security group; the installer only manages `ufw`.
@@ -114,7 +115,8 @@ Re-running upgrades in place. If endlessh holds the tarpit port, the installer o
 | `/etc/systemd/system/limitlessh.service` | sandboxed tarpit service |
 | `/etc/systemd/system/limitlessh-geoupdate.{service,timer}` | monthly geo database update |
 | `/var/log/limitlessh/connections*.log[.gz]` | connection log (root-readable only) |
-| `/var/lib/limitlessh/stats.json` | live and lifetime stats |
+| `/var/lib/limitlessh/stats.json` | lifetime stats |
+| `/var/lib/limitlessh/live.json` | current sessions, only while `--live` is running |
 | `/var/lib/limitlessh-geo/*.mmdb` | geolocation databases |
 
 ## SSH port move
@@ -153,6 +155,8 @@ log-retention-days = 90       # 0 = keep by count only
 log-rate           = 200      # max log lines per second
 stats-file         = /var/lib/limitlessh/stats.json
 stats-interval     = 60
+live-file          = /var/lib/limitlessh/live.json   # for --live; omit to disable
+live-max           = 2000     # sessions per live snapshot
 ```
 
 `sudo systemctl reload limitlessh` applies changes without dropping clients. Invalid values are rejected and the current settings kept. Lowered limits trim existing clients.
@@ -187,6 +191,8 @@ total: accepted=91204 attacker-time=38d4h sent=2.1MiB | top: 203.0.113.7(31), �
 ## Reports
 
 ```bash
+sudo limitlessh-report --live                  # live view, refreshes every 2 s, q to quit
+sudo limitlessh-report --live --interval 1
 sudo limitlessh-report                         # last 7 days
 sudo limitlessh-report --since 24h --top 20
 sudo limitlessh-report --since 2026-09-01 --until 2026-10-01
@@ -196,6 +202,23 @@ sudo limitlessh-report --since 30d --csv connections.csv   # raw records + geolo
 sudo limitlessh-report --since all --jsonl -               # same, JSON lines
 sudo limitlessh-report --json > report.json                # full report as JSON
 ```
+
+Output is coloured on a terminal; `--color never|always`, or set `NO_COLOR`. Piped output is plain.
+
+### Live view
+
+`--live` opens a full-screen view that redraws every `--interval` seconds (default 2) until `q`:
+
+- active clients against `max-clients` (gauge), networks, trapped and rejected per minute
+- attacker time held right now, this run and lifetime; counts by outcome
+- current sessions, longest held first: IP, time held, start, bytes sent, location, network
+- top active source IPs and the most recent events
+
+Piped (`--live | cat`) or with `--once`, it prints a single frame.
+
+The tarpit has no network access, so the report tool can't query it directly. `--live` touches `/var/lib/limitlessh/live.json.request`; while that file is less than 15 s old, the tarpit writes a snapshot to `live.json` once a second (at most `live-max` sessions, longest held first). Nothing is written when nobody is watching. Because the report runs as root inside a directory owned by the service user, it opens these files with `O_NOFOLLOW`, refuses non-regular or multiply-linked files, and validates every field.
+
+### Report contents
 
 Report sections: live status and lifetime totals; overview (trapped, rejected, unique IPs and networks, new IPs, attacker time, average and longest hold); how connections ended; time-held distribution; top IPs by attacker time and by connections; top countries; top ASNs/ISPs; longest sessions; daily totals; hour-of-day activity. Times are local unless `--utc`.
 
@@ -311,7 +334,7 @@ git clone --depth 1 https://github.com/maxmind/MaxMind-DB.git tests/MaxMind-DB
 python3 test_reporting.py     # geo tests use MaxMind's test databases
 ```
 
-Tests cover banner format, bounded source statistics, kernel receive buffer size, per-IP/per-network limits, eviction, accepting while full, max lifetime, unread client data, stalled clients, signals and reload, summaries, socket activation (needs `systemd-socket-activate`), config errors, and 3,000 concurrent clients. `test_reporting.py` covers log rate cap, rotation, compression, retention, unwritable logs, stats persistence and tampered stats files, `.mmdb` decoding against MaxMind's reference reader, hostile `.mmdb` files (payload amplification, pointer loops, over-limit records), report counts and input validation, output sanitising, and updater refusal of wrong-type databases, decompression bombs and missing files.
+Tests cover banner format, bounded source statistics, kernel receive buffer size, per-IP/per-network limits, eviction, accepting while full, max lifetime, unread client data, stalled clients, signals and reload, summaries, socket activation (needs `systemd-socket-activate`), config errors, and 3,000 concurrent clients. `test_reporting.py` covers log rate cap, rotation, compression, retention, unwritable logs, stats persistence and tampered stats files, `.mmdb` decoding against MaxMind's reference reader, hostile `.mmdb` files (payload amplification, pointer loops, over-limit records), report counts and input validation, output sanitising, updater refusal of wrong-type databases, decompression bombs and missing files, live snapshots (request gating, cap, ordering), refusal of symlinked, FIFO and hard-linked request files and symlinked logs, colour/width handling, and the interactive `--live` loop in a pseudo-terminal.
 
 ## Limitations
 
@@ -324,6 +347,13 @@ Tests cover banner format, bounded source statistics, kernel receive buffer size
 - An attacker controlling many /64s (e.g. a /48) can fill all slots and cause continuous eviction. Impact is limited to the tarpit; lower `ipv6-prefix` (e.g. 48) to group them.
 
 ## Changelog
+
+**1.2.0** — live view and colour
+- `limitlessh-report --live`: auto-refreshing full-screen view of current sessions, rates, top sources and recent events.
+- Coloured report output with width-correct tables; `--color`, `NO_COLOR`.
+- Tarpit: `live-file` / `live-max`; snapshots written only while requested.
+- Report: files in the service-owned directories opened without following symlinks; symlinked logs skipped.
+- Tarpit: starts accepting only after signal handlers are installed, so an early stop signal still saves stats.
 
 **1.1.0** — reporting and geolocation
 - Connection log: JSON lines, rate cap, size rotation, gzip, pruning by count and age.

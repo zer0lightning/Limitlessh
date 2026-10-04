@@ -481,5 +481,201 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(str(cm.exception).count("HTTP 404"), 2)
 
 
+# ---------------------------------------------------------------------------
+# Live view
+# ---------------------------------------------------------------------------
+
+class LiveSnapshotTests(unittest.TestCase):
+    def test_written_only_while_requested_and_capped(self):
+        d = tempfile.mkdtemp()
+        live = os.path.join(d, "live.json")
+        port = free_port()
+        p = subprocess.Popen([sys.executable, DAEMON, "--bind", "127.0.0.1", "--port", str(port), "--delay", "0.3",
+                              "--per-ip", "100", "--live-file", live, "--live-max", "10"], stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(1)
+            socks = [socket.create_connection(("127.0.0.1", port)) for _ in range(15)]
+            time.sleep(1.5)
+            self.assertFalse(os.path.exists(live), "no snapshot without a request")
+            rep.touch_request(live + ".request")
+            time.sleep(1.5)
+            snap = rep.parse_live(rep.read_json_file(live, 1 << 20))
+            self.assertEqual(snap["active"], 15)
+            self.assertEqual(len(snap["sessions"]), 10)
+            self.assertEqual(snap["sessions_truncated"], 5)
+            self.assertEqual(snap["accepts_per_min"], 15)
+            starts = [s["start_ts"] for s in snap["sessions"]]
+            self.assertEqual(starts, sorted(starts), "oldest first")
+            # A stale request stops further writes
+            old = time.time() - 60
+            os.utime(live + ".request", (old, old))
+            time.sleep(1.2)
+            mtime = os.path.getmtime(live)
+            time.sleep(2.2)
+            self.assertEqual(os.path.getmtime(live), mtime)
+            for s in socks:
+                s.close()
+        finally:
+            p.send_signal(signal.SIGTERM)
+            p.wait(10)
+
+
+class LiveSafetyTests(unittest.TestCase):
+    """The report runs as root against a directory owned by the service user."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def test_touch_creates_plain_file(self):
+        path = os.path.join(self.dir, "live.json.request")
+        rep.touch_request(path)
+        self.assertTrue(os.path.isfile(path))
+        self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
+
+    def test_touch_refuses_symlink(self):
+        victim = os.path.join(self.dir, "victim")
+        link = os.path.join(self.dir, "live.json.request")
+        os.symlink(victim, link)
+        with self.assertRaises(rep.ReportError):
+            rep.touch_request(link)
+        self.assertFalse(os.path.exists(victim), "must not create the symlink target")
+
+    def test_touch_refuses_fifo_and_hardlink(self):
+        fifo = os.path.join(self.dir, "fifo.request")
+        os.mkfifo(fifo)
+        t0 = time.time()
+        with self.assertRaises(rep.ReportError):
+            rep.touch_request(fifo)
+        self.assertLess(time.time() - t0, 2, "must not block on a FIFO")
+        target = os.path.join(self.dir, "precious")
+        open(target, "w").close()
+        old = time.time() - 1000
+        os.utime(target, (old, old))
+        link = os.path.join(self.dir, "hard.request")
+        os.link(target, link)
+        with self.assertRaises(rep.ReportError):
+            rep.touch_request(link)
+        self.assertAlmostEqual(os.path.getmtime(target), old, delta=1)
+
+    def test_read_refuses_symlink_and_oversize(self):
+        real = os.path.join(self.dir, "real.json")
+        with open(real, "w") as f:
+            json.dump({"a": 1}, f)
+        link = os.path.join(self.dir, "link.json")
+        os.symlink(real, link)
+        self.assertEqual(rep.read_json_file(real, 1000), {"a": 1})
+        self.assertIsNone(rep.read_json_file(link, 1000))
+        self.assertIsNone(rep.read_json_file(real, 3))
+        self.assertIsNone(rep.read_json_file(os.path.join(self.dir, "missing"), 1000))
+
+    def test_log_symlinks_ignored(self):
+        log = os.path.join(self.dir, "connections.log")
+        secret = os.path.join(self.dir, "secret")
+        open(secret, "w").write("root:x:0:0\n")
+        os.symlink(secret, log)
+        os.symlink(secret, os.path.join(self.dir, "connections-20260101T000000Z.log"))
+        self.assertEqual(rep.log_files(log), [])
+
+    def test_parse_live_drops_bad_entries(self):
+        raw = {"updated_ts": time.time(), "active": "lots", "max_clients": 10,
+               "sessions": [{"ip": "203.0.113.5", "start_ts": 1, "bytes": 5},
+                            {"ip": "\x1b[2Jevil", "start_ts": 1, "bytes": 5}, "junk"],
+               "recent": [{"ts": 1, "ip": "203.0.113.5", "result": "pwned"},
+                          {"ts": 1, "ip": "203.0.113.5", "result": "closed", "dur": 3}],
+               "top_active_ips": [["203.0.113.5", 2], ["bad", 1], "junk"]}
+        snap = rep.parse_live(raw)
+        self.assertEqual(snap["active"], 0)
+        self.assertEqual([s["ip"] for s in snap["sessions"]], ["203.0.113.5"])
+        self.assertEqual(len(snap["recent"]), 1)
+        self.assertEqual(snap["top"], [("203.0.113.5", 2)])
+        self.assertIsNone(rep.parse_live(None))
+
+
+class OutputTests(unittest.TestCase):
+    def tearDown(self):
+        rep.S = rep.Style(False)
+
+    def test_colour_does_not_break_widths(self):
+        rep.S = rep.Style(True)
+        now = time.time()
+        snap = rep.parse_live({
+            "updated_ts": now, "started_ts": now - 100, "active": 3, "max_clients": 10, "networks": 2,
+            "sessions": [{"ip": "203.0.113.%d" % i, "start_ts": now - i * 1000, "bytes": i} for i in range(1, 40)],
+            "recent": [{"ts": now, "ip": "198.51.100.1", "result": r, "dur": 5} for r in rep.RESULTS],
+            "top_active_ips": [["203.0.113.1", 3]]})
+        for width, height in ((80, 24), (140, 50), (200, 60)):
+            screen = rep.render_live(snap, rep.NoGeo(), True, width, height, 2)
+            lines = screen.split("\n")
+            self.assertLessEqual(len(lines), height)
+            self.assertLessEqual(max(rep.vlen(x) for x in lines), width)
+            self.assertNotIn("\x1b", rep._ANSI.sub("", screen))
+
+    def test_clip_and_table(self):
+        rep.S = rep.Style(True)
+        s = rep.S("abcdef", "red") + "ghij"
+        self.assertEqual(rep.vlen(rep.clip(s, 4)), 4)
+        self.assertEqual(rep._ANSI.sub("", rep.clip(s, 8)), "abcdefgh")
+        t = rep.table(["A", "B"], [[rep.S("x", "red"), "yy"], ["zzz", rep.S("w", "green")]], "lr")
+        widths = {rep.vlen(x.rstrip()) for x in t.split("\n")[2:]}
+        self.assertEqual(len(widths), 1, t)
+
+    def test_colour_mode(self):
+        old = os.environ.get("NO_COLOR")
+        try:
+            os.environ["NO_COLOR"] = "1"
+            self.assertFalse(rep.color_mode("auto"))
+            self.assertTrue(rep.color_mode("always"))
+            del os.environ["NO_COLOR"]
+            self.assertFalse(rep.color_mode("never"))
+        finally:
+            if old is not None:
+                os.environ["NO_COLOR"] = old
+
+    def test_piped_output_has_no_escapes(self):
+        p = subprocess.run([sys.executable, REPORT, "--lookup", "203.0.113.1", "--geo-dir", "/nonexistent"],
+                           capture_output=True, text=True)
+        self.assertNotIn("\x1b", p.stdout)
+        p = subprocess.run([sys.executable, REPORT, "--lookup", "203.0.113.1", "--geo-dir", "/nonexistent",
+                            "--color", "always"], capture_output=True, text=True)
+        self.assertIn("\x1b[", p.stdout)
+
+    def test_interactive_live_quits_and_restores_terminal(self):
+        import pty
+        d = tempfile.mkdtemp()
+        live = os.path.join(d, "live.json")
+        with open(live, "w") as f:
+            json.dump({"updated_ts": time.time(), "active": 0, "max_clients": 10}, f)
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execvp(sys.executable, [sys.executable, REPORT, "--live", "--interval", "0.5",
+                                       "--live-file", live, "--no-geo"])
+        out = b""
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            r, _, _ = __import__("select").select([fd], [], [], 0.2)
+            if r:
+                out += os.read(fd, 65536)
+        os.write(fd, b"q")
+        status = None
+        deadline = time.time() + 5
+        while time.time() < deadline and status is None:
+            try:
+                r, _, _ = __import__("select").select([fd], [], [], 0.2)
+                if r:
+                    out += os.read(fd, 65536)
+            except OSError:
+                pass
+            done, st = os.waitpid(pid, os.WNOHANG)
+            if done:
+                status = os.waitstatus_to_exitcode(st)
+        if status is None:
+            os.kill(pid, signal.SIGKILL)
+        text = out.decode("utf-8", "replace")
+        self.assertEqual(status, 0)
+        self.assertIn("\x1b[?1049h", text)
+        self.assertIn("\x1b[?25h\x1b[?1049l", text)
+        self.assertGreaterEqual(text.count("\x1b[H"), 2, "should have refreshed")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

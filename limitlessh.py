@@ -30,6 +30,7 @@ import collections
 import concurrent.futures
 import datetime
 import glob
+import itertools
 import gzip
 import ipaddress
 import json
@@ -45,7 +46,7 @@ import string
 import sys
 import time
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 PROG = "limitlessh"
 LOG = logging.getLogger(PROG)
 
@@ -158,6 +159,11 @@ OPTIONS = [
      "write live and lifetime stats as JSON to this file ('' = off)"),
     ("stats-interval", _ranged(float, 5.0, 3600.0), 60.0,
      "seconds between stats file updates"),
+    ("live-file", _path, "",
+     "write current sessions here once a second while limitlessh-report --live is "
+     "watching (it touches LIVE-FILE.request) ('' = off)"),
+    ("live-max", _ranged(int, 10, 100000), 2000,
+     "maximum sessions included in a live snapshot (longest-held first)"),
 ]
 OPTION_MAP = {name: (conv, default) for name, conv, default, _ in OPTIONS}
 
@@ -569,6 +575,11 @@ class Tarpit(object):
         self.cfg = cfg
         self.loop = loop
         self.events = events
+        # Last events and per-second counters, for the live view only
+        self.recent = collections.deque(maxlen=100)
+        self.rate_stamp = [0] * 60
+        self.rate_accept = [0] * 60
+        self.rate_reject = [0] * 60
         self.started_ts = time.time()
         (self.life_base, self.life_since, self.life_peak,
          self.life_peak_ts) = load_lifetime(cfg.stats_file, self.COUNTERS)
@@ -669,6 +680,7 @@ class Tarpit(object):
         members[client] = None
         self._move_net(net, old, old + 1)
         self.count("accepted")
+        self._rate(self.rate_accept)
         if len(self.clients) > self.peak:
             self.peak = len(self.clients)
         if len(self.clients) > self.life_peak:
@@ -741,7 +753,23 @@ class Tarpit(object):
         self._event(client.wall_start, client.ip, held, client.sent, reason)
         return True
 
+    def _rate(self, slots):
+        now = int(time.time())
+        i = now % 60
+        if self.rate_stamp[i] != now:
+            self.rate_stamp[i] = now
+            self.rate_accept[i] = 0
+            self.rate_reject[i] = 0
+        slots[i] += 1
+
+    def per_minute(self, slots):
+        cutoff = int(time.time()) - 60
+        return sum(n for n, stamp in zip(slots, self.rate_stamp) if stamp > cutoff)
+
     def _event(self, ts, ip, held, sent, result):
+        self.recent.append((time.time(), ip, result, round(held, 1), sent))
+        if result.startswith("rejected"):
+            self._rate(self.rate_reject)
         if self.events is not None:
             self.events.record({"ts": iso_utc(ts), "ip": ip, "dur": round(held, 1),
                                 "bytes": sent, "result": result})
@@ -807,6 +835,60 @@ class Tarpit(object):
             self.window_untracked = 0
             self.window_start = now
             self.peak = len(self.clients)
+
+    def live_snapshot(self):
+        now = self.loop.time()
+        wall = time.time()
+        cap = self.cfg.live_max
+        sessions = [{"ip": c.ip, "net": c.net, "start_ts": round(c.wall_start, 1), "bytes": c.sent}
+                    for c in itertools.islice(self.clients, cap)]  # oldest (longest held) first
+        return {
+            "version": 1,
+            "updated_ts": round(wall, 3),
+            "started_ts": round(self.started_ts, 3),
+            "active": len(self.clients),
+            "networks": len(self.by_net),
+            "max_clients": self.cfg.max_clients,
+            "per_ip": self.cfg.per_ip,
+            "per_net": self.cfg.per_net,
+            "delay": self.cfg.delay,
+            "peak_window": self.peak,
+            "active_time": round(self.active_time(now), 1),
+            "accepts_per_min": self.per_minute(self.rate_accept),
+            "rejects_per_min": self.per_minute(self.rate_reject),
+            "session": {"counters": {k: (round(v, 1) if isinstance(v, float) else v)
+                                     for k, v in self.totals.items()}},
+            "lifetime_accepted": self.life_base["accepted"] + self.totals["accepted"],
+            "lifetime_wasted": round(self.life_base["wasted"] + self.totals["wasted"], 1),
+            "top_active_ips": [[ip, n] for ip, n in self.by_ip.most_common(25)],
+            "recent": [{"ts": round(t, 1), "ip": ip, "result": r, "dur": d, "bytes": b}
+                       for t, ip, r, d, b in list(self.recent)[-50:]],
+            "sessions": sessions,
+            "sessions_truncated": max(0, len(self.clients) - cap),
+        }
+
+    def write_live(self):
+        """Write a snapshot only while a viewer has touched the .request file
+        in the last 15 seconds, so nothing is written when nobody watches."""
+        path = self.cfg.live_file
+        if not path:
+            return
+        try:
+            if time.time() - os.stat(path + ".request").st_mtime > 15:
+                return
+        except OSError:
+            return
+        tmp = "%s.tmp.%d" % (path, os.getpid())
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.live_snapshot(), f, separators=(",", ":"))
+            os.replace(tmp, path)
+        except OSError as e:
+            LOG.warning("cannot write live file %s: %s", path, e.strerror or e)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     def active_time(self, now):
         return sum(now - c.start for c in self.clients)
@@ -956,11 +1038,6 @@ async def serve(cfg, sock, activated, config_path, cli_values):
     events = EventLog(cfg, loop)
     events.configure(cfg)
     tarpit = Tarpit(cfg, loop, events)
-    server = await loop.create_server(lambda: TarpitProtocol(tarpit), sock=sock, backlog=4096)
-    name = sock.getsockname()
-    LOG.info("limitlessh %s listening on [%s]:%d%s (max-clients=%d per-ip=%d per-net=%d delay=%gs)",
-             VERSION, name[0], name[1], " via systemd" if activated else "",
-             cfg.max_clients, cfg.per_ip, cfg.per_net, cfg.delay)
     if os.geteuid() == 0 and not activated:
         LOG.warning("running as root; prefer the systemd units, which run it unprivileged")
     if cfg.log_file:
@@ -985,6 +1062,7 @@ async def serve(cfg, sock, activated, config_path, cli_values):
     every("flush", lambda: 1.0, events.flush)
     every("stats", lambda: tarpit.cfg.stats_interval, tarpit.write_stats)
     every("prune", lambda: 3600.0, events.prune_later)
+    every("live", lambda: 1.0, tarpit.write_live)
     tarpit.write_stats()
 
     def schedule_summary():
@@ -1038,6 +1116,14 @@ async def serve(cfg, sock, activated, config_path, cli_values):
 
     loop.add_signal_handler(signal.SIGUSR1, on_usr1)
     schedule_summary()
+
+    # Start accepting only now, so a stop signal at any point after this is
+    # handled cleanly (stats saved, log closed) instead of killing the process.
+    server = await loop.create_server(lambda: TarpitProtocol(tarpit), sock=sock, backlog=4096)
+    name = sock.getsockname()
+    LOG.info("limitlessh %s listening on [%s]:%d%s (max-clients=%d per-ip=%d per-net=%d delay=%gs)",
+             VERSION, name[0], name[1], " via systemd" if activated else "",
+             cfg.max_clients, cfg.per_ip, cfg.per_net, cfg.delay)
 
     try:
         await stop
