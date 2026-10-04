@@ -578,10 +578,10 @@ class LiveSafetyTests(unittest.TestCase):
 
     def test_parse_live_drops_bad_entries(self):
         raw = {"updated_ts": time.time(), "active": "lots", "max_clients": 10,
-               "sessions": [{"ip": "203.0.113.5", "start_ts": 1, "bytes": 5},
-                            {"ip": "\x1b[2Jevil", "start_ts": 1, "bytes": 5}, "junk"],
-               "recent": [{"ts": 1, "ip": "203.0.113.5", "result": "pwned"},
-                          {"ts": 1, "ip": "203.0.113.5", "result": "closed", "dur": 3}],
+               "sessions": [{"ip": "203.0.113.5", "start_ts": time.time() - 60, "bytes": 5},
+                            {"ip": "\x1b[2Jevil", "start_ts": time.time() - 60, "bytes": 5}, "junk"],
+               "recent": [{"ts": time.time(), "ip": "203.0.113.5", "result": "pwned"},
+                          {"ts": time.time(), "ip": "203.0.113.5", "result": "closed", "dur": 3}],
                "top_active_ips": [["203.0.113.5", 2], ["bad", 1], "junk"]}
         snap = rep.parse_live(raw)
         self.assertEqual(snap["active"], 0)
@@ -675,6 +675,132 @@ class OutputTests(unittest.TestCase):
         self.assertIn("\x1b[?1049h", text)
         self.assertIn("\x1b[?25h\x1b[?1049l", text)
         self.assertGreaterEqual(text.count("\x1b[H"), 2, "should have refreshed")
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the 1.2.1 audit
+# ---------------------------------------------------------------------------
+
+class Audit121Tests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def test_nested_json_never_crashes(self):
+        deep = os.path.join(self.dir, "deep.json")
+        with open(deep, "w") as f:
+            f.write("[" * 200000)
+        self.assertIsNone(rep.read_json_file(deep, 1 << 20))
+        with open(deep, "w") as f:
+            f.write('{"lifetime":' + "[" * 200000 + "}")
+        counters, _, _, _ = limitlessh.load_lifetime(deep, limitlessh.Tarpit.COUNTERS)
+        self.assertEqual(counters["accepted"], 0)
+        log = os.path.join(self.dir, "connections.log")
+        with open(log, "w") as f:
+            f.write("[" * 4000 + "\n" + "{" * 4000 + "\n")
+        stats = rep.LogStats()
+        self.assertEqual(list(rep.read_records(log, 0, time.time(), stats)), [])
+        self.assertEqual(stats.invalid, 2)
+
+    def test_export_refuses_symlink(self):
+        victim = os.path.join(self.dir, "victim")
+        with open(victim, "w") as f:
+            f.write("precious\n")
+        out = os.path.join(self.dir, "out.csv")
+        os.symlink(victim, out)
+        with self.assertRaises(rep.ReportError):
+            rep.open_output(out)
+        self.assertEqual(open(victim).read(), "precious\n")
+        fifo = os.path.join(self.dir, "fifo.csv")
+        os.mkfifo(fifo)
+        with self.assertRaises(rep.ReportError):
+            rep.open_output(fifo)
+        fh, close = rep.open_output(os.path.join(self.dir, "ok.csv"))
+        fh.write("x")
+        fh.close()
+        existing = os.path.join(self.dir, "existing.csv")
+        with open(existing, "w") as f:
+            f.write("old content that is long\n")
+        fh, _ = rep.open_output(existing)
+        fh.write("new\n")
+        fh.close()
+        self.assertEqual(open(existing).read(), "new\n", "existing file must be truncated")
+
+    def test_fifo_log_and_geo_do_not_block(self):
+        log = os.path.join(self.dir, "connections.log")
+        os.mkfifo(log)
+        os.mkfifo(os.path.join(self.dir, "connections-20260101T000000Z.log.gz"))
+        t0 = time.time()
+        self.assertEqual(list(rep.read_records(log, 0, time.time(), rep.LogStats())), [])
+        self.assertLess(time.time() - t0, 2)
+        fifo_db = os.path.join(self.dir, "GeoLite2-ASN.mmdb")
+        os.mkfifo(fifo_db)
+        with self.assertRaises(rep.MMDBError):
+            rep.MMDB(fifo_db)
+        self.assertLess(time.time() - t0, 3)
+
+    def test_log_swapped_for_symlink_is_not_followed(self):
+        log = os.path.join(self.dir, "connections.log")
+        secret = os.path.join(self.dir, "secret")
+        with open(secret, "w") as f:
+            f.write(line(time.time(), "203.0.113.66", 1, "closed"))
+        os.symlink(secret, log)
+        self.assertIsNone(rep._open_log(log))
+
+    def test_absurd_snapshot_values(self):
+        snap = rep.parse_live({"updated_ts": 1e17, "started_ts": -5, "active": 1e300, "max_clients": -3,
+                               "sessions": [{"ip": "203.0.113.1", "start_ts": -1e17, "bytes": 1e300},
+                                            {"ip": "203.0.113.2", "start_ts": time.time() - 5, "bytes": -1}],
+                               "recent": [{"ts": 9e18, "ip": "203.0.113.1", "result": "closed", "dur": 1}],
+                               "session": {"counters": {"wasted": float("inf"), "accepted": 1e300}}})
+        self.assertEqual(snap["updated_ts"], 0.0)
+        self.assertEqual([s["ip"] for s in snap["sessions"]], ["203.0.113.2"])
+        self.assertEqual(snap["sessions"][0]["bytes"], 0)
+        self.assertEqual(snap["recent"], [])
+        self.assertLessEqual(snap["active"], 1e12)
+        for width in (60, 120):
+            rep.render_live(snap, rep.NoGeo(), True, width, 30, 2, "stale")
+        self.assertEqual(rep.fmt_clock(1e17, True), "-")
+
+    def test_report_ip_table_is_capped(self):
+        saved = rep.MAX_TRACKED_IPS
+        rep.MAX_TRACKED_IPS = 100
+        try:
+            r = rep.Report(rep.NoGeo())
+            for i in range(250):
+                r.add({"t": 1.8e9 + i, "ip": "2001:db8::%x" % i, "dur": 2.0, "bytes": 1, "result": "closed"})
+            self.assertEqual(len(r.ips), 100)
+            self.assertEqual(r.untracked, 150)
+            self.assertEqual(r.trapped, 250)
+            self.assertAlmostEqual(r.wasted, 500.0)
+        finally:
+            rep.MAX_TRACKED_IPS = saved
+
+    def test_updater_refuses_https_to_http_redirect(self):
+        handler = rep._HttpsOnlyRedirects()
+        req = __import__("urllib.request").request.Request("https://download.db-ip.com/free/x.gz")
+        with self.assertRaises(rep.ReportError):
+            handler.redirect_request(req, None, 302, "Found", {}, "http://evil.example/x.gz")
+        ok = handler.redirect_request(req, None, 302, "Found", {}, "https://cdn.example/x.gz")
+        self.assertEqual(ok.full_url, "https://cdn.example/x.gz")
+
+    def test_suppressed_events_are_cheap(self):
+        loop = asyncio.new_event_loop()
+        try:
+            c = cfg(log_file=os.path.join(self.dir, "flood.log"), log_rate=1)
+            ev = limitlessh.EventLog(c, loop)
+            ev.configure(c)
+            tp = limitlessh.Tarpit(c, loop, ev)
+            t0 = time.perf_counter()
+            for _ in range(50000):
+                tp._event(1.8e9, "203.0.113.1", 0.0, 0, "rejected-ip")
+            per_event = (time.perf_counter() - t0) / 50000
+            ev.shutdown()
+            self.assertLess(per_event, 10e-6)
+            self.assertGreaterEqual(ev.total_suppressed, 49990)
+            with open(c.log_file) as f:
+                self.assertLessEqual(sum(1 for x in f if '"result"' in x), 5)
+        finally:
+            loop.close()
 
 
 if __name__ == "__main__":

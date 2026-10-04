@@ -46,7 +46,7 @@ import string
 import sys
 import time
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 PROG = "limitlessh"
 LOG = logging.getLogger(PROG)
 
@@ -396,10 +396,12 @@ class EventLog(object):
             self._open()
         return self.fh is not None
 
-    def record(self, data):
-        """Rate-limited write of one event."""
+    def admit(self):
+        """Rate cap: True if one more line may be written this second.
+        Callers check this before formatting, so suppressed events cost
+        almost nothing during a flood."""
         if not self.path:
-            return
+            return False
         now = int(time.time())
         if now != self.second:
             self._flush_suppressed()
@@ -408,9 +410,14 @@ class EventLog(object):
         if self.in_second >= self.cfg.log_rate:
             self.suppressed += 1
             self.total_suppressed += 1
-            return
+            return False
         self.in_second += 1
-        self._write(data)
+        return True
+
+    def record(self, data):
+        """Rate-limited write of one event."""
+        if self.admit():
+            self._write(data)
 
     def _flush_suppressed(self, force=False):
         if self.suppressed and (force or int(time.time()) != self.second):
@@ -513,8 +520,8 @@ def load_lifetime(path, keys):
         return counters, since, peak, peak_ts
     except FileNotFoundError:
         return dict.fromkeys(keys, 0), now, 0, now
-    except (OSError, ValueError, TypeError, AttributeError) as e:
-        LOG.warning("ignoring unreadable stats file %s: %s", path, e)
+    except (OSError, ValueError, TypeError, AttributeError, RecursionError) as e:
+        LOG.warning("ignoring unreadable stats file %s: %s", path, type(e).__name__)
         return dict.fromkeys(keys, 0), now, 0, now
 
 
@@ -767,11 +774,11 @@ class Tarpit(object):
         return sum(n for n, stamp in zip(slots, self.rate_stamp) if stamp > cutoff)
 
     def _event(self, ts, ip, held, sent, result):
-        self.recent.append((time.time(), ip, result, round(held, 1), sent))
-        if result.startswith("rejected"):
+        self.recent.append((ts, ip, result, held, sent))
+        if result[0] == "r":  # rejected-*
             self._rate(self.rate_reject)
-        if self.events is not None:
-            self.events.record({"ts": iso_utc(ts), "ip": ip, "dur": round(held, 1),
+        if self.events is not None and self.events.admit():
+            self.events._write({"ts": iso_utc(ts), "ip": ip, "dur": round(held, 1),
                                 "bytes": sent, "result": result})
 
     # -- sending -------------------------------------------------------------
@@ -861,7 +868,7 @@ class Tarpit(object):
             "lifetime_accepted": self.life_base["accepted"] + self.totals["accepted"],
             "lifetime_wasted": round(self.life_base["wasted"] + self.totals["wasted"], 1),
             "top_active_ips": [[ip, n] for ip, n in self.by_ip.most_common(25)],
-            "recent": [{"ts": round(t, 1), "ip": ip, "result": r, "dur": d, "bytes": b}
+            "recent": [{"ts": round(t, 1), "ip": ip, "result": r, "dur": round(d, 1), "bytes": b}
                        for t, ip, r, d, b in list(self.recent)[-50:]],
             "sessions": sessions,
             "sessions_truncated": max(0, len(self.clients) - cap),
@@ -884,7 +891,7 @@ class Tarpit(object):
                 json.dump(self.live_snapshot(), f, separators=(",", ":"))
             os.replace(tmp, path)
         except OSError as e:
-            LOG.warning("cannot write live file %s: %s", path, e.strerror or e)
+            self._warn_once("live", "cannot write live file %s: %s" % (path, e.strerror or e))
             try:
                 os.unlink(tmp)
             except OSError:
@@ -940,6 +947,15 @@ class Tarpit(object):
             },
         }
 
+    def _warn_once(self, key, message):
+        """At most one warning per minute per kind, so a full disk can't flood the journal."""
+        now = time.monotonic()
+        last = getattr(self, "_warned", {})
+        if now - last.get(key, -1e9) >= 60:
+            LOG.warning("%s", message)
+            last[key] = now
+            self._warned = last
+
     def write_stats(self):
         path = self.cfg.stats_file
         if not path:
@@ -951,7 +967,7 @@ class Tarpit(object):
                 f.write("\n")
             os.replace(tmp, path)
         except OSError as e:
-            LOG.warning("cannot write stats file %s: %s", path, e.strerror or e)
+            self._warn_once("stats", "cannot write stats file %s: %s" % (path, e.strerror or e))
             try:
                 os.unlink(tmp)
             except OSError:

@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-VERSION="1.2.0"
+VERSION="1.2.2"
 
 # Defaults (environment variables also work, flags override them)
 PORT="${PORT:-22}"                       # tarpit port
@@ -430,7 +430,7 @@ import string
 import sys
 import time
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 PROG = "limitlessh"
 LOG = logging.getLogger(PROG)
 
@@ -780,10 +780,12 @@ class EventLog(object):
             self._open()
         return self.fh is not None
 
-    def record(self, data):
-        """Rate-limited write of one event."""
+    def admit(self):
+        """Rate cap: True if one more line may be written this second.
+        Callers check this before formatting, so suppressed events cost
+        almost nothing during a flood."""
         if not self.path:
-            return
+            return False
         now = int(time.time())
         if now != self.second:
             self._flush_suppressed()
@@ -792,9 +794,14 @@ class EventLog(object):
         if self.in_second >= self.cfg.log_rate:
             self.suppressed += 1
             self.total_suppressed += 1
-            return
+            return False
         self.in_second += 1
-        self._write(data)
+        return True
+
+    def record(self, data):
+        """Rate-limited write of one event."""
+        if self.admit():
+            self._write(data)
 
     def _flush_suppressed(self, force=False):
         if self.suppressed and (force or int(time.time()) != self.second):
@@ -897,8 +904,8 @@ def load_lifetime(path, keys):
         return counters, since, peak, peak_ts
     except FileNotFoundError:
         return dict.fromkeys(keys, 0), now, 0, now
-    except (OSError, ValueError, TypeError, AttributeError) as e:
-        LOG.warning("ignoring unreadable stats file %s: %s", path, e)
+    except (OSError, ValueError, TypeError, AttributeError, RecursionError) as e:
+        LOG.warning("ignoring unreadable stats file %s: %s", path, type(e).__name__)
         return dict.fromkeys(keys, 0), now, 0, now
 
 
@@ -1151,11 +1158,11 @@ class Tarpit(object):
         return sum(n for n, stamp in zip(slots, self.rate_stamp) if stamp > cutoff)
 
     def _event(self, ts, ip, held, sent, result):
-        self.recent.append((time.time(), ip, result, round(held, 1), sent))
-        if result.startswith("rejected"):
+        self.recent.append((ts, ip, result, held, sent))
+        if result[0] == "r":  # rejected-*
             self._rate(self.rate_reject)
-        if self.events is not None:
-            self.events.record({"ts": iso_utc(ts), "ip": ip, "dur": round(held, 1),
+        if self.events is not None and self.events.admit():
+            self.events._write({"ts": iso_utc(ts), "ip": ip, "dur": round(held, 1),
                                 "bytes": sent, "result": result})
 
     # -- sending -------------------------------------------------------------
@@ -1245,7 +1252,7 @@ class Tarpit(object):
             "lifetime_accepted": self.life_base["accepted"] + self.totals["accepted"],
             "lifetime_wasted": round(self.life_base["wasted"] + self.totals["wasted"], 1),
             "top_active_ips": [[ip, n] for ip, n in self.by_ip.most_common(25)],
-            "recent": [{"ts": round(t, 1), "ip": ip, "result": r, "dur": d, "bytes": b}
+            "recent": [{"ts": round(t, 1), "ip": ip, "result": r, "dur": round(d, 1), "bytes": b}
                        for t, ip, r, d, b in list(self.recent)[-50:]],
             "sessions": sessions,
             "sessions_truncated": max(0, len(self.clients) - cap),
@@ -1268,7 +1275,7 @@ class Tarpit(object):
                 json.dump(self.live_snapshot(), f, separators=(",", ":"))
             os.replace(tmp, path)
         except OSError as e:
-            LOG.warning("cannot write live file %s: %s", path, e.strerror or e)
+            self._warn_once("live", "cannot write live file %s: %s" % (path, e.strerror or e))
             try:
                 os.unlink(tmp)
             except OSError:
@@ -1324,6 +1331,15 @@ class Tarpit(object):
             },
         }
 
+    def _warn_once(self, key, message):
+        """At most one warning per minute per kind, so a full disk can't flood the journal."""
+        now = time.monotonic()
+        last = getattr(self, "_warned", {})
+        if now - last.get(key, -1e9) >= 60:
+            LOG.warning("%s", message)
+            last[key] = now
+            self._warned = last
+
     def write_stats(self):
         path = self.cfg.stats_file
         if not path:
@@ -1335,7 +1351,7 @@ class Tarpit(object):
                 f.write("\n")
             os.replace(tmp, path)
         except OSError as e:
-            LOG.warning("cannot write stats file %s: %s", path, e.strerror or e)
+            self._warn_once("stats", "cannot write stats file %s: %s" % (path, e.strerror or e))
             try:
                 os.unlink(tmp)
             except OSError:
@@ -1584,6 +1600,7 @@ import datetime
 import glob
 import gzip
 import hashlib
+import io
 import ipaddress
 import json
 import math
@@ -1596,10 +1613,11 @@ import struct
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.0"
+VERSION = "1.2.2"
 PROG = "limitlessh-report"
 
 DEFAULT_LOG = "/var/log/limitlessh/connections.log"
@@ -1616,6 +1634,11 @@ DBIP_URL = "https://download.db-ip.com/free/dbip-{edition}-lite-{month}.mmdb.gz"
 MAX_DOWNLOAD_BYTES = 400 * 1048576      # compressed
 MAX_DATABASE_BYTES = 1536 * 1048576     # decompressed
 MAX_LOG_LINE = 4096
+# Distinct IPs tracked per report. Beyond this, records are still counted in
+# totals but not broken down per IP, so a huge log can't exhaust memory.
+MAX_TRACKED_IPS = 500000
+# Timestamps outside 2000-2100 in snapshot files are treated as invalid.
+TS_MIN, TS_MAX = 946684800.0, 4102444800.0
 # Well-known addresses any complete database covers; used to sanity-check downloads.
 VERIFY_PROBES = ("1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222")
 RESULTS = ("closed", "evicted", "stalled", "expired", "shutdown", "rejected-ip", "rejected-net")
@@ -1650,9 +1673,13 @@ class MMDB(object):
 
     def __init__(self, path):
         self.path = path
-        self._file = open(path, "rb")
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+        self._file = os.fdopen(fd, "rb")
         try:
-            size = os.fstat(self._file.fileno()).st_size
+            st = os.fstat(self._file.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                raise MMDBError("not a regular file")
+            size = st.st_size
             if size < 64 or size > MAX_DATABASE_BYTES:
                 raise MMDBError("unexpected file size %d" % size)
             self.buf = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
@@ -2021,9 +2048,19 @@ def _months_to_try():
     return (this, prev)
 
 
+class _HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    """https_only: refuse any redirect that would leave HTTPS."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if req.full_url.startswith("https://") and not newurl.startswith("https://"):
+            raise ReportError("refusing redirect from HTTPS to %s" % newurl[:100])
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _download(url, dest, limit):
     req = urllib.request.Request(url, headers={"User-Agent": "limitlessh-report/%s" % VERSION})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    opener = urllib.request.build_opener(_HttpsOnlyRedirects)
+    with opener.open(req, timeout=60) as resp:
         if resp.status != 200:
             raise ReportError("HTTP %d for %s" % (resp.status, url))
         length = resp.headers.get("Content-Length")
@@ -2172,6 +2209,24 @@ def _rotated_stamp(path):
     return None
 
 
+def _open_log(path):
+    """Open a log for reading as text. The directory belongs to the service user,
+    so refuse symlinks (O_NOFOLLOW, no check-then-open race) and anything that
+    isn't a regular file, such as a FIFO that would block forever."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    raw = os.fdopen(fd, "rb")
+    if not stat.S_ISREG(os.fstat(raw.fileno()).st_mode):
+        raw.close()
+        return None
+    if path.endswith(".gz"):
+        return io.TextIOWrapper(gzip.GzipFile(fileobj=raw, mode="rb"), encoding="utf-8", errors="replace")
+    return io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
+
+
 def _bounded_lines(fh):
     """Yield lines, skipping any longer than MAX_LOG_LINE without buffering them."""
     while True:
@@ -2204,8 +2259,11 @@ def read_records(log_path, since, until, stats):
             continue  # rotated before the period started
         stats.files += 1
         try:
-            opener = gzip.open if path.endswith(".gz") else open
-            with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
+            fh = _open_log(path)
+            if fh is None:
+                print("%s: warning: skipping %s (not a regular file)" % (PROG, path), file=sys.stderr)
+                continue
+            with fh:
                 for line in _bounded_lines(fh):
                     rec = _parse_line(line, stats)
                     if rec is not None and since <= rec["t"] <= until:
@@ -2223,7 +2281,7 @@ def _parse_line(line, stats):
         return None
     try:
         d = json.loads(line)
-    except ValueError:
+    except (ValueError, RecursionError):
         stats.invalid += 1
         return None
     if not isinstance(d, dict):
@@ -2278,6 +2336,7 @@ class Report(object):
         self.hours = collections.Counter()
         self.days = {}
         self.longest = []
+        self.untracked = 0
 
     def add(self, r):
         t = r["t"]
@@ -2285,8 +2344,13 @@ class Report(object):
         self.last = t if self.last is None else max(self.last, t)
         ip = self.ips.get(r["ip"])
         if ip is None:
-            ip = self.ips[r["ip"]] = {"conns": 0, "rejected": 0, "time": 0.0, "bytes": 0,
-                                      "first": t, "last": t, "longest": 0.0}
+            if len(self.ips) >= MAX_TRACKED_IPS:
+                self.untracked += 1
+                ip = {"conns": 0, "rejected": 0, "time": 0.0, "bytes": 0, "first": t, "last": t,
+                      "longest": 0.0}  # counted in totals, not kept per IP
+            else:
+                ip = self.ips[r["ip"]] = {"conns": 0, "rejected": 0, "time": 0.0, "bytes": 0,
+                                          "first": t, "last": t, "longest": 0.0}
         ip["first"] = min(ip["first"], t)
         ip["last"] = max(ip["last"], t)
         stamp = datetime.datetime.fromtimestamp(t) if self.local else \
@@ -2368,6 +2432,7 @@ class Report(object):
                 "longest_hold": round(self.longest[0]["dur"], 1) if self.longest else 0,
                 "service_starts": log_stats.starts, "suppressed_log_lines": log_stats.suppressed,
                 "invalid_log_lines": log_stats.invalid,
+                "records_without_ip_breakdown": self.untracked,
             },
             "results": dict(self.results),
             "hold_time": {label: self.hold[label] for _, label in HOLD_BUCKETS},
@@ -2419,10 +2484,13 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def clean(text, width=None):
-    """Strip control and bidi characters so data can't drive the terminal."""
+    """Strip control and bidi characters so data can't drive the terminal.
+    In ASCII mode, accented letters are transliterated (Linköping -> Linkoping)."""
     s = _CONTROL.sub("", str(text))
+    if G is GLYPHS_ASCII or G.get("full") == "#":
+        s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
     if width is not None and len(s) > width:
-        s = s[:max(1, width - 1)] + "…"
+        s = s[:max(1, width - 3)] + "..."
     return s
 
 
@@ -2451,6 +2519,17 @@ class Style(object):
 
 
 S = Style(False)
+
+# Bar and rule characters. Box-drawing blocks by default; plain ASCII with
+# --ascii or when the terminal isn't UTF-8. No other symbols are used.
+GLYPHS_UNICODE = {"full": "█", "half": "▌", "tiny": "▏", "empty": "░", "rule": "─"}
+GLYPHS_ASCII = {"full": "#", "half": "", "tiny": "|", "empty": ".", "rule": "-"}
+G = dict(GLYPHS_UNICODE)
+
+
+def use_ascii(force):
+    enc = (getattr(sys.stdout, "encoding", "") or "").lower().replace("-", "")
+    return force or bool(os.environ.get("LIMITLESSH_ASCII")) or enc not in ("utf8", "utf8sig")
 
 RESULT_STYLE = {"closed": ("green",), "evicted": ("yellow",), "stalled": ("magenta",),
                 "expired": ("blue",), "shutdown": ("grey",),
@@ -2529,6 +2608,8 @@ def fmt_time(iso_text, local):
 
 
 def fmt_clock(ts, local):
+    if not TS_MIN <= num(ts) <= TS_MAX:
+        return "-"
     dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
     if local:
         dt = dt.astimezone()
@@ -2550,9 +2631,9 @@ def bar(value, maximum, width=30, *styles):
         return ""
     n = value / float(maximum) * width
     full = int(n)
-    text = "█" * full + ("▌" if n - full >= 0.5 else "")
+    text = G["full"] * full + (G["half"] if n - full >= 0.5 else "")
     if not text and value > 0:
-        text = "▏"
+        text = G["tiny"]
     return S(text, *styles) if styles else text
 
 
@@ -2560,11 +2641,11 @@ def gauge(value, maximum, width):
     frac = 0.0 if maximum <= 0 else min(1.0, value / float(maximum))
     full = int(round(frac * width))
     colour = "green" if frac < 0.6 else "yellow" if frac < 0.9 else "red"
-    return S("█" * full, colour) + S("░" * (width - full), "grey")
+    return S(G["full"] * full, colour) + S(G["empty"] * (width - full), "grey")
 
 
 def heading(title, extra=""):
-    line = S("▍", "bcyan") + S(title, "bold", "bcyan")
+    line = S(title, "bold", "bcyan")
     return line + ("  " + S(extra, "grey") if extra else "")
 
 
@@ -2577,7 +2658,7 @@ def table(headers, rows, aligns, indent="  "):
     def line(cells, head=False):
         parts = [pad(S(c, "bold") if head else c, w, a) for c, w, a in zip(cells, widths, aligns)]
         return (indent + "  ".join(parts)).rstrip()
-    out = [line(headers, True), indent + S("  ".join("─" * w for w in widths), "grey")]
+    out = [line(headers, True), indent + S("  ".join(G["rule"] * w for w in widths), "grey")]
     out += [line(r) for r in rows]
     return "\n".join(out)
 
@@ -2609,16 +2690,16 @@ def render_text(d, local, geo_available, attribution):
     w = out.append
     since = fmt_time(d["period"]["since"], local) if d["period"]["since"] else "start of logs"
     w(S(" limitlessh report ", "bold", "inverse") + "  " +
-      S("%s → %s (%s)" % (since, fmt_time(d["period"]["until"], local), "local time" if local else "UTC"), "grey"))
+      S("%s to %s (%s)" % (since, fmt_time(d["period"]["until"], local), "local time" if local else "UTC"), "grey"))
     live = d.get("live")
     if live:
         life = live.get("lifetime", {}) if isinstance(live.get("lifetime"), dict) else {}
         lc = life.get("counters", {}) if isinstance(life.get("counters"), dict) else {}
         uptime = num(live.get("updated_ts")) - num(live.get("started_ts"))
-        w("%s %s active of %s · up %s · stats updated %s" % (
+        w("%s %s active of %s, up %s, stats updated %s" % (
             S("Live    ", "bold"), big(fmt_int(num(live.get("active")))), fmt_int(num(live.get("max_clients"))),
             fmt_dur(max(0, uptime)), fmt_time(clean(live.get("updated", "")), local)))
-        w("%s since %s: %s trapped · %s attacker time · peak %s active (%s)" % (
+        w("%s since %s: %s trapped, %s attacker time, peak %s active (%s)" % (
             S("Lifetime", "bold"), fmt_time(clean(life.get("since", "")), local),
             big(fmt_int(num(lc.get("accepted")))), big(fmt_dur(num(lc.get("wasted")) + num(live.get("active_time")))),
             fmt_int(num(life.get("peak_active"))), fmt_time(clean(life.get("peak", "")), local)))
@@ -2634,6 +2715,9 @@ def render_text(d, local, geo_available, attribution):
     ]
     for a, b, c, e in pairs:
         w("  %s %s     %s %s" % (pad(a, 22), pad(big(b), 12, "r"), pad(c, 16), pad(big(e), 12, "r")))
+    if o.get("records_without_ip_breakdown"):
+        w("  " + S("Note: more than %s distinct IPs; %s records are in totals but not in per-IP tables" % (
+            fmt_int(MAX_TRACKED_IPS), fmt_int(o["records_without_ip_breakdown"])), "yellow"))
     if o["suppressed_log_lines"] or o["invalid_log_lines"]:
         w("  " + S("Note: %s events not logged (rate cap), %s unreadable log lines skipped" % (
             fmt_int(o["suppressed_log_lines"]), fmt_int(o["invalid_log_lines"])), "yellow"))
@@ -2802,9 +2886,14 @@ def read_json_file(path, limit):
         return None
     try:
         value = json.loads(data.decode("utf-8", "replace"))
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _ts(v):
+    v = num(v)
+    return v if TS_MIN <= v <= TS_MAX else 0.0
 
 
 def _valid_ip(v):
@@ -2818,12 +2907,19 @@ def parse_live(raw):
     """Validate a live snapshot; everything in it is treated as untrusted."""
     if not raw:
         return None
-    snap = {k: num(raw.get(k)) for k in ("updated_ts", "started_ts", "active", "networks", "max_clients",
+    snap = {k: num(raw.get(k)) for k in ("active", "networks", "max_clients",
                                          "per_ip", "per_net", "delay", "peak_window", "active_time",
                                          "accepts_per_min", "rejects_per_min", "lifetime_accepted",
                                          "lifetime_wasted", "sessions_truncated")}
+    snap["updated_ts"] = _ts(raw.get("updated_ts"))
+    snap["started_ts"] = _ts(raw.get("started_ts"))
+    for k in ("active", "networks", "max_clients", "per_ip", "per_net", "sessions_truncated",
+              "accepts_per_min", "rejects_per_min", "lifetime_accepted"):
+        snap[k] = min(max(snap[k], 0), 1e12)
+    for k in ("active_time", "lifetime_wasted", "delay", "peak_window"):
+        snap[k] = min(max(snap[k], 0), 1e13)
     sc = raw.get("session", {}).get("counters", {}) if isinstance(raw.get("session"), dict) else {}
-    snap["counters"] = {k: num(sc.get(k)) for k in ("accepted", "rejected_ip", "rejected_net", "evicted",
+    snap["counters"] = {k: min(max(num(sc.get(k)), 0), 1e15) for k in ("accepted", "rejected_ip", "rejected_net", "evicted",
                                                      "stalled", "expired", "closed", "wasted")} \
         if isinstance(sc, dict) else {}
     sessions = []
@@ -2831,22 +2927,27 @@ def parse_live(raw):
         if isinstance(s, dict):
             ip = _valid_ip(s.get("ip"))
             if ip:
-                sessions.append({"ip": ip, "start_ts": num(s.get("start_ts")), "bytes": int(num(s.get("bytes")))})
+                start = _ts(s.get("start_ts"))
+                if start:
+                    sessions.append({"ip": ip, "start_ts": start, "bytes": int(min(max(num(s.get("bytes")), 0), 1e15))})
     snap["sessions"] = sessions
     recent = []
     for e in (raw.get("recent") or [])[:1000] if isinstance(raw.get("recent"), list) else []:
         if isinstance(e, dict) and e.get("result") in RESULTS:
             ip = _valid_ip(e.get("ip"))
             if ip:
-                recent.append({"ts": num(e.get("ts")), "ip": ip, "result": e["result"],
-                               "dur": num(e.get("dur")), "bytes": int(num(e.get("bytes")))})
+                when = _ts(e.get("ts"))
+                if when:
+                    recent.append({"ts": when, "ip": ip, "result": e["result"],
+                                   "dur": min(max(num(e.get("dur")), 0), 1e10),
+                                   "bytes": int(min(max(num(e.get("bytes")), 0), 1e15))})
     snap["recent"] = recent
     top = []
     for item in (raw.get("top_active_ips") or [])[:100] if isinstance(raw.get("top_active_ips"), list) else []:
         if isinstance(item, list) and len(item) == 2:
             ip = _valid_ip(item[0])
             if ip:
-                top.append((ip, int(num(item[1]))))
+                top.append((ip, int(min(max(num(item[1]), 0), 1e9))))
     snap["top"] = top
     return snap
 
@@ -2864,14 +2965,14 @@ def render_live(snap, geo, local, width, height, interval, stale_reason=None):
     w = lines.append
     title = S(" limitlessh live ", "bold", "inverse")
     if stale_reason:
-        status = S("● " + stale_reason, "byellow")
+        status = S(" STALE ", "bold", "inverse", "yellow") + " " + S(stale_reason, "byellow")
     else:
-        status = S("●", "bgreen") + S(" updated %s" % fmt_clock(snap["updated_ts"], local), "grey")
-    right = S(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "  ·  every %gs  ·  q quit" % interval, "grey")
+        status = S(" LIVE ", "bold", "inverse", "green") + S(" updated %s" % fmt_clock(snap["updated_ts"], local), "grey")
+    right = S(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "   every %gs   q to quit" % interval, "grey")
     w(title + "  " + status + " " * max(1, width - vlen(title) - vlen(status) - vlen(right) - 2) + right)
     if snap is None:
         w("")
-        w(S("  Waiting for data from limitlessh…", "yellow"))
+        w(S("  Waiting for data from limitlessh...", "yellow"))
         w(S("  Check that the service is running and that live-file is set in /etc/limitlessh/limitlessh.conf.", "grey"))
         return "\n".join(lines)
 
@@ -2884,7 +2985,7 @@ def render_live(snap, geo, local, width, height, interval, stale_reason=None):
                                         S("networks", "grey"), big(fmt_int(snap["networks"]))))
     w("  %s %s trapped   %s rejected   %s" % (
         S("PER MIN  ", "bold"), S("+" + fmt_int(snap["accepts_per_min"]), "bgreen", "bold"),
-        S("−" + fmt_int(snap["rejects_per_min"]), "bred", "bold"),
+        S("-" + fmt_int(snap["rejects_per_min"]), "bred", "bold"),
         S("(limits: %d per IP, %d per network)" % (snap["per_ip"], snap["per_net"]), "grey")))
     held_now = sum(max(0.0, now - s["start_ts"]) for s in snap["sessions"]) if snap["sessions"] else snap["active_time"]
     w("  %s %s held right now   %s this run   %s lifetime   %s" % (
@@ -2893,7 +2994,7 @@ def render_live(snap, geo, local, width, height, interval, stale_reason=None):
         big(fmt_dur(snap["lifetime_wasted"] + held_now)),
         S("up %s" % fmt_dur(now - snap["started_ts"]) if snap["started_ts"] else "", "grey")))
     c = snap["counters"]
-    w("  %s %s trapped · %s closed · %s evicted · %s stalled · %s rejected" % (
+    w("  %s %s trapped, %s closed, %s evicted, %s stalled, %s rejected" % (
         S("THIS RUN ", "bold"), big(fmt_int(c.get("accepted", 0))), S(fmt_int(c.get("closed", 0)), "green"),
         S(fmt_int(c.get("evicted", 0)), "yellow"), S(fmt_int(c.get("stalled", 0)), "magenta"),
         S(fmt_int(c.get("rejected_ip", 0) + c.get("rejected_net", 0)), "red")))
@@ -2908,7 +3009,7 @@ def render_live(snap, geo, local, width, height, interval, stale_reason=None):
     shown = "showing %d of %s" % (len(sessions), fmt_int(active))
     if snap["sessions_truncated"]:
         shown += " (snapshot capped)"
-    w(heading("CURRENT SESSIONS", "longest held first · " + shown))
+    w(heading("CURRENT SESSIONS", "longest held first, " + shown))
     rows = []
     for i, s in enumerate(sessions, 1):
         held = max(0.0, now - s["start_ts"])
@@ -3041,6 +3142,9 @@ def parse_args(argv):
     p.add_argument("--until", default="", help="end of period (default: now)")
     p.add_argument("--top", type=int, default=10, help="rows in top lists (default: 10)")
     p.add_argument("--utc", action="store_true", help="show times in UTC instead of local time")
+    p.add_argument("--ascii", action="store_true",
+                   help="plain ASCII bars and lines (automatic when the terminal is not UTF-8; "
+                        "or set LIMITLESSH_ASCII=1)")
     p.add_argument("--color", choices=("auto", "always", "never"), default="auto",
                    help="colour output (default: auto; NO_COLOR disables)")
     out = p.add_mutually_exclusive_group()
@@ -3074,16 +3178,34 @@ def parse_args(argv):
 
 
 def open_output(path):
+    """Open an export file. Refuse symlinks and non-regular files, so running as
+    root in a shared directory can't be turned into overwriting another file."""
     if path == "-":
         return sys.stdout, False
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0) |
+             getattr(os, "O_CLOEXEC", 0))
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as e:
+        raise ReportError("cannot write %s: %s (symlinks are refused)" % (path, e.strerror or e))
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        os.close(fd)
+        raise ReportError("refusing to write %s: not a plain file" % path)
+    os.ftruncate(fd, 0)
     return os.fdopen(fd, "w", encoding="utf-8", newline=""), True
 
 
 def main(argv=None):
-    global S
+    global S, G
     args = parse_args(sys.argv[1:] if argv is None else argv)
     S = Style(color_mode(args.color))
+    G = dict(GLYPHS_ASCII if use_ascii(args.ascii) else GLYPHS_UNICODE)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")  # never crash on a terminal's encoding
+        except (AttributeError, ValueError):
+            pass
     try:
         if args.update_geo:
             update_geo(args.geo_dir, args.geo_edition, quiet=args.quiet)
