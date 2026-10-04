@@ -198,7 +198,7 @@ sudo limitlessh-report --json > report.json
 ```
 
 Report sections: live status and lifetime totals; overview (trapped, rejected, unique IPs and networks, new IPs, attacker time, average and longest hold); outcomes; hold-time distribution; top IPs by attacker time and by connections; top countries; top ASNs; longest sessions; daily totals; hour of day. Times are local unless `--utc`.
-
+![Limitlessh](./assets/reportconsole.png)
 Output:
 
 - Colour on terminals; `--color never|always`; `NO_COLOR` disables.
@@ -208,7 +208,7 @@ Output:
 CSV/JSONL columns: `time_utc, ip, result, duration_s, bytes, country_code, country, region, city, latitude, longitude, asn, org`. Export files are created with mode 0600.
 
 ### Live view
-
+![Limitlessh](./assets/liveconsole.png)
 `--live` redraws every `--interval` seconds (default 2) until `q`:
 
 - active clients vs `max-clients`, networks, trapped and rejected per minute
