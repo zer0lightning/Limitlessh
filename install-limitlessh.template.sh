@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-VERSION="1.2.2"
+VERSION="1.2.3"
 
 # Defaults (environment variables also work, flags override them)
 PORT="${PORT:-22}"                       # tarpit port

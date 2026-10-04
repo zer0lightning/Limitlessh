@@ -39,7 +39,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 PROG = "limitlessh-report"
 
 DEFAULT_LOG = "/var/log/limitlessh/connections.log"
@@ -479,7 +479,8 @@ class _HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _download(url, dest, limit):
+def _download(url, out, limit):
+    """Stream url into the open binary file `out`, enforcing a size limit."""
     req = urllib.request.Request(url, headers={"User-Agent": "limitlessh-report/%s" % VERSION})
     opener = urllib.request.build_opener(_HttpsOnlyRedirects)
     with opener.open(req, timeout=60) as resp:
@@ -490,22 +491,24 @@ def _download(url, dest, limit):
             raise ReportError("%s is larger than the %d MiB limit" % (url, limit // 1048576))
         total = 0
         h = hashlib.sha256()
-        with open(dest, "wb") as out:
-            while True:
-                chunk = resp.read(1048576)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > limit:
-                    raise ReportError("%s exceeded the %d MiB limit" % (url, limit // 1048576))
-                h.update(chunk)
-                out.write(chunk)
+        while True:
+            chunk = resp.read(1048576)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise ReportError("%s exceeded the %d MiB limit" % (url, limit // 1048576))
+            h.update(chunk)
+            out.write(chunk)
+    out.flush()
     return h.hexdigest(), total
 
 
 def _gunzip(src, dest, limit):
+    """Decompress open file `src` into open file `dest`, enforcing a size limit."""
+    src.seek(0)
     total = 0
-    with gzip.open(src, "rb") as zin, open(dest, "wb") as out:
+    with gzip.GzipFile(fileobj=src, mode="rb") as zin:
         while True:
             chunk = zin.read(1048576)
             if not chunk:
@@ -513,7 +516,8 @@ def _gunzip(src, dest, limit):
             total += len(chunk)
             if total > limit:
                 raise ReportError("decompressed database exceeds %s bytes; refusing" % fmt_int(limit))
-            out.write(chunk)
+            dest.write(chunk)
+    dest.flush()
     return total
 
 
@@ -528,47 +532,105 @@ def _verify_database(path, kind):
             raise ReportError("downloaded database is more than 400 days old")
         if not any(isinstance(db.lookup(ipaddress.ip_address(a)), dict) for a in VERIFY_PROBES):
             raise ReportError("database has no data for well-known addresses; refusing it")
-        return db.database_type, db.build_epoch
+        return clean(db.database_type, 64), db.build_epoch
+
+
+def _enter_geo_dir(geo_dir):
+    """Work inside geo_dir with the least privilege available.
+
+    The directory normally belongs to the updater's DynamicUser. If root runs
+    --update-geo, anything that user planted there (symlinks, swapped temp
+    files) would otherwise be followed with root's privileges. So: hold the
+    directory as the working directory, then, if we are root and the directory
+    belongs to someone else, become that user before touching any file in it.
+    Returns (restore, dropped): restore() returns to the previous directory
+    when privileges were not dropped.
+    """
+    os.makedirs(geo_dir, mode=0o755, exist_ok=True)
+    try:
+        prev = os.open(".", os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        prev = None
+    dfd = os.open(geo_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
+    try:
+        st = os.fstat(dfd)
+        os.fchdir(dfd)
+    finally:
+        os.close(dfd)
+    dropped = False
+    if os.geteuid() == 0 and st.st_uid != 0:
+        os.setgroups([])
+        os.setgid(st.st_gid)
+        os.setuid(st.st_uid)
+        dropped = True
+
+    def restore():
+        if prev is not None:
+            try:
+                if not dropped:
+                    os.fchdir(prev)
+            except OSError:
+                pass
+            os.close(prev)
+    return restore, dropped
+
+
+def _fd_path(f):
+    """A path that refers to the open file itself, not to a name someone could swap."""
+    proc = "/proc/self/fd/%d" % f.fileno()
+    return proc if os.path.exists(proc) else f.name
 
 
 def update_geo(geo_dir, edition, quiet=False):
     if edition not in ("city", "country"):
         raise ReportError("edition must be city or country")
-    os.makedirs(geo_dir, mode=0o755, exist_ok=True)
+    restore, dropped = _enter_geo_dir(geo_dir)
+    try:
+        if dropped and not quiet:
+            print("running as uid %d (owner of %s)" % (os.getuid(), geo_dir))
+        _update_geo_here(geo_dir, edition, quiet)
+    finally:
+        restore()
+
+
+def _update_geo_here(geo_dir, edition, quiet):
+    """Runs with the geo directory as the working directory. Every temporary
+    file is created with O_EXCL under a random name and written, verified and
+    chmod-ed through its own descriptor; nothing is reopened by name."""
     installed = {}
     for kind in (edition, "asn"):
-        final = os.path.join(geo_dir, "dbip-%s-lite.mmdb" % kind)
+        final = "dbip-%s-lite.mmdb" % kind
         errors = []
         done = False
         for month in _months_to_try():
             url = DBIP_URL.format(edition=kind, month=month)
-            gz_fd, gz_tmp = tempfile.mkstemp(prefix=".dl-", suffix=".gz", dir=geo_dir)
-            db_fd, db_tmp = tempfile.mkstemp(prefix=".db-", suffix=".mmdb", dir=geo_dir)
-            os.close(gz_fd)
-            os.close(db_fd)
+            gz = tempfile.NamedTemporaryFile(prefix=".dl-", suffix=".gz", dir=".", delete=False)
+            db = tempfile.NamedTemporaryFile(prefix=".db-", suffix=".mmdb", dir=".", delete=False)
             try:
                 if not quiet:
                     print("downloading %s" % url)
-                digest, size = _download(url, gz_tmp, MAX_DOWNLOAD_BYTES)
-                _gunzip(gz_tmp, db_tmp, MAX_DATABASE_BYTES)
-                dtype, built = _verify_database(db_tmp, kind)
-                os.chmod(db_tmp, 0o644)
-                os.replace(db_tmp, final)
-                installed[kind] = {"file": os.path.basename(final), "url": url, "month": month,
+                digest, size = _download(url, gz, MAX_DOWNLOAD_BYTES)
+                _gunzip(gz, db, MAX_DATABASE_BYTES)
+                dtype, built = _verify_database(_fd_path(db), kind)
+                os.fchmod(db.fileno(), 0o644)
+                os.replace(db.name, final)
+                installed[kind] = {"file": final, "url": url, "month": month,
                                    "sha256_gz": digest, "type": dtype,
                                    "built": time.strftime("%Y-%m-%d", time.gmtime(built)) if built else ""}
                 if not quiet:
-                    print("installed %s (%s, %.1f MiB download)" % (final, dtype, size / 1048576.0))
+                    print("installed %s (%s, %.1f MiB download)"
+                          % (os.path.join(geo_dir, final), dtype, size / 1048576.0))
                 done = True
                 break
             except urllib.error.HTTPError as e:
                 errors.append("%s: HTTP %d" % (url, e.code))
             except (urllib.error.URLError, OSError, ReportError, MMDBError, EOFError, gzip.BadGzipFile) as e:
-                errors.append("%s: %s" % (url, getattr(e, "reason", None) or e))
+                errors.append("%s: %s" % (url, clean(getattr(e, "reason", None) or e, 200)))
             finally:
-                for tmp in (gz_tmp, db_tmp):
+                for f in (gz, db):
+                    f.close()
                     try:
-                        os.unlink(tmp)
+                        os.unlink(f.name)  # unlink never follows symlinks
                     except OSError:
                         pass
         if not done:
@@ -577,16 +639,16 @@ def update_geo(geo_dir, edition, quiet=False):
     # A city database replaces a country one and vice versa
     other = "country" if edition == "city" else "city"
     try:
-        os.unlink(os.path.join(geo_dir, "dbip-%s-lite.mmdb" % other))
+        os.unlink("dbip-%s-lite.mmdb" % other)
     except OSError:
         pass
     info = {"updated": time.strftime(TS_FORMAT, time.gmtime()), "source": "DB-IP Lite (CC BY 4.0, https://db-ip.com)",
             "databases": installed}
-    tmp = os.path.join(geo_dir, ".source.json.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
+    with tempfile.NamedTemporaryFile("w", prefix=".source-", suffix=".json", dir=".",
+                                     delete=False, encoding="utf-8") as f:
         json.dump(info, f, indent=1)
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, os.path.join(geo_dir, "source.json"))
+        os.fchmod(f.fileno(), 0o644)
+    os.replace(f.name, "source.json")
 
 
 # ---------------------------------------------------------------------------
@@ -1227,7 +1289,7 @@ def render_text(d, local, geo_available, attribution):
         if attribution:
             w(S("IP geolocation by DB-IP (https://db-ip.com), licensed CC BY 4.0.", "grey"))
     else:
-        w(S("Geolocation: not available. Run 'sudo limitlessh-report --update-geo' to download DB-IP Lite.", "yellow"))
+        w(S("Geolocation: not available. Run 'sudo systemctl start limitlessh-geoupdate' to download DB-IP Lite.", "yellow"))
     return "\n".join(out)
 
 

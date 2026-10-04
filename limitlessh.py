@@ -46,7 +46,7 @@ import string
 import sys
 import time
 
-VERSION = "1.2.1"
+VERSION = "1.2.3"
 PROG = "limitlessh"
 LOG = logging.getLogger(PROG)
 
@@ -316,6 +316,20 @@ def set_log_level(level):
 # Connection log and stats file
 # ---------------------------------------------------------------------------
 
+def open_new(path, mode="w"):
+    """Create a temporary file exclusively, never following a symlink at `path`.
+    Matters when limitlessh runs outside its sandbox in a shared directory."""
+    try:
+        os.unlink(path)  # stale leftover from a crash; unlink does not follow links
+    except OSError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags, 0o600)
+    if "b" in mode:
+        return os.fdopen(fd, mode)
+    return os.fdopen(fd, mode, encoding="utf-8")
+
+
 def iso_utc(ts):
     return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -470,7 +484,8 @@ class EventLog(object):
             prefix = self._rotated_prefix()
             for raw in sorted(glob.glob(glob.escape(prefix) + "*.log")):
                 tmp = raw + ".gz.tmp"
-                with open(raw, "rb") as src, gzip.open(tmp, "wb", compresslevel=6) as dst:
+                with open(raw, "rb") as src, open_new(tmp, "wb") as out, \
+                        gzip.GzipFile(fileobj=out, mode="wb", compresslevel=6) as dst:
                     shutil.copyfileobj(src, dst, 1048576)
                 os.replace(tmp, raw + ".gz")
                 os.unlink(raw)
@@ -887,7 +902,7 @@ class Tarpit(object):
             return
         tmp = "%s.tmp.%d" % (path, os.getpid())
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
+            with open_new(tmp) as f:
                 json.dump(self.live_snapshot(), f, separators=(",", ":"))
             os.replace(tmp, path)
         except OSError as e:
@@ -962,7 +977,7 @@ class Tarpit(object):
             return
         tmp = "%s.tmp.%d" % (path, os.getpid())
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
+            with open_new(tmp) as f:
                 json.dump(self.stats_snapshot(), f, indent=1, sort_keys=True)
                 f.write("\n")
             os.replace(tmp, path)

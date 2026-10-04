@@ -1,6 +1,7 @@
-# Limitlessh
+# limitlessh
+
 ![Limitlessh](./assets/banner.jpg)
-Hardened SSH tarpit inspired by [endlessh]. Holds scanners on port 22 with an endless random banner, while the real sshd runs on another port.
+Hardened SSH tarpit inspired by [endlessh](https://github.com/skeeto/endlessh). Holds scanners on port 22 with an endless random banner, while the real sshd runs on another port.
 
 ```
 scanner -> :22    limitlessh   random line, 10 s, random line, ... (forever)
@@ -227,7 +228,7 @@ When piped or with `--once`, a single frame is printed.
 {"ts":"2026-10-04T07:26:01Z","ip":"203.0.113.7","dur":5321.4,"bytes":11210,"result":"closed"}
 {"ts":"2026-10-04T07:26:02Z","ip":"203.0.113.7","dur":0.0,"bytes":0,"result":"rejected-ip"}
 {"ts":"2026-10-04T07:26:03Z","suppressed":1840}
-{"ts":"2026-10-04T07:20:00Z","event":"start","version":"1.2.2"}
+{"ts":"2026-10-04T07:20:00Z","event":"start","version":"1.2.3"}
 ```
 
 - `ts`: connection start, UTC.
@@ -242,6 +243,7 @@ Lookups run offline in `limitlessh-report` against `.mmdb` files in `/var/lib/li
 - The ISP column is the ASN organisation. `GeoIP2-ISP.mmdb` is used if present.
 - `GeoLite2-City.mmdb` / `GeoLite2-ASN.mmdb` placed in the geo directory take precedence over DB-IP files.
 - Downloads are verified before replacement: HTTPS only (including redirects), size limits (400 MiB compressed, 1.5 GiB decompressed), database type, build date, test lookups.
+- `limitlessh-report --update-geo` run as root switches to the owner of the geo directory before touching files in it; temporary files are created exclusively and written through their descriptors. Prefer `sudo systemctl start limitlessh-geoupdate`.
 - The `.mmdb` reader is bounds-checked and enforces the MaxMind DB spec per-lookup limits (65,536 values, 2 MiB payload).
 
 ### Privacy
@@ -323,7 +325,7 @@ python3 test_reporting.py     # geo tests need MaxMind test databases
 
 `test_limitlessh.py`: banner format, limits, eviction, accepting while full, max lifetime, unread client data, stalled clients, signals and reload, summaries, socket activation (needs `systemd-socket-activate`), config errors, 3,000 concurrent clients, kernel buffer size, bounded statistics.
 
-`test_reporting.py`: log rate cap, rotation, retention, stats persistence and tampering, `.mmdb` decoding against the reference reader, hostile `.mmdb` files, report counts and validation, output sanitising, updater refusal cases, live snapshots, symlink/FIFO/hard-link refusal, colour and width handling, interactive `--live` in a pseudo-terminal, audit regressions.
+`test_reporting.py`: log rate cap, rotation, retention, stats persistence and tampering, `.mmdb` decoding against the reference reader, hostile `.mmdb` files, report counts and validation, output sanitising, updater refusal cases, live snapshots, symlink/FIFO/hard-link refusal, colour and width handling, interactive `--live` in a pseudo-terminal, audit regressions (privilege-drop tests require root).
 
 ## Limitations
 
@@ -337,6 +339,12 @@ python3 test_reporting.py     # geo tests need MaxMind test databases
 - Under sustained floods the log rate cap drops per-connection records (stats counts remain exact), and count-based pruning can shorten history before `log-retention-days`.
 
 ## Changelog
+
+**1.2.3** (security)
+- Geo updater run as root (`sudo limitlessh-report --update-geo`) followed symlinks in the service-owned geo directory: a planted `.source.json.tmp` link, or temp files swapped for links between creation and reopening, made root overwrite and `chmod 0644` arbitrary files (e.g. `/etc/shadow`). It now drops to the directory owner's UID, creates temp files with `O_EXCL` under random names, and writes, verifies and `fchmod`s through descriptors.
+- Geo updater printed database metadata unsanitised (terminal escape injection).
+- Report suggests `systemctl start limitlessh-geoupdate` instead of running the updater as root.
+- Tarpit: stats, live and log-compression temp files created with `O_EXCL | O_NOFOLLOW`.
 
 **1.2.2**
 - Report: removed status dot, heading markers, arrows and middle dots; status is a `LIVE`/`STALE` label.

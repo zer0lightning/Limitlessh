@@ -21,6 +21,7 @@ import json
 import os
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -801,6 +802,128 @@ class Audit121Tests(unittest.TestCase):
                 self.assertLessEqual(sum(1 for x in f if '"result"' in x), 5)
         finally:
             loop.close()
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the 1.2.3 audit
+# ---------------------------------------------------------------------------
+
+@needs_data
+@unittest.skipUnless(os.geteuid() == 0, "needs root to test privilege dropping")
+class Audit123Tests(unittest.TestCase):
+    """Root running --update-geo inside a directory owned by another user."""
+    OTHER_UID = 65534
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv_dir = tempfile.mkdtemp()
+        month = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
+        city = open(os.path.join(TEST_DATA, "GeoLite2-City-Test.mmdb"), "rb").read()
+        asn = open(os.path.join(TEST_DATA, "GeoLite2-ASN-Test.mmdb"), "rb").read()
+        evil = city.replace(b"GeoLite2-City", b"\x1b]2;PWN\x07 City", 1)
+        for name, data in (("city", city), ("asn", asn), ("evilcity", evil)):
+            with gzip.open(os.path.join(cls.srv_dir, "dbip-%s-lite-%s.mmdb.gz" % (name, month)), "wb") as g:
+                g.write(data)
+        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=cls.srv_dir)
+        handler.log_message = lambda *a: None
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def setUp(self):
+        base = tempfile.mkdtemp()
+        os.chmod(base, 0o755)
+        self.geo = os.path.join(base, "geo")
+        os.mkdir(self.geo)
+        os.chown(self.geo, self.OTHER_UID, self.OTHER_UID)
+        self.victim = os.path.join(base, "shadow")
+        with open(self.victim, "w") as f:
+            f.write("root:secret\n")
+        os.chmod(self.victim, 0o600)
+
+    def update_in_child(self, edition="city"):
+        """Run update_geo in a child process (it may drop privileges); return (exit code, stdout)."""
+        port = self.server.server_address[1]
+        rd, wr = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(rd)
+            os.dup2(wr, 1)
+            rep.VERIFY_PROBES = ("81.2.69.160", "1.128.0.0")
+            rep.DBIP_URL = "http://127.0.0.1:%d/dbip-{edition}-lite-{month}.mmdb.gz" % port
+            try:
+                rep.update_geo(self.geo, edition, quiet=False)
+                code = 0
+            except BaseException:
+                code = 1
+            sys.stdout.flush()
+            os._exit(code)
+        os.close(wr)
+        out = b""
+        while True:
+            chunk = os.read(rd, 65536)
+            if not chunk:
+                break
+            out += chunk
+        os.close(rd)
+        _, status = os.waitpid(pid, 0)
+        return os.waitstatus_to_exitcode(status), out.decode("utf-8", "replace")
+
+    def test_planted_symlinks_do_not_reach_root_files(self):
+        for name in (".source.json.tmp", "source.json", "dbip-city-lite.mmdb", "dbip-asn-lite.mmdb",
+                     "dbip-country-lite.mmdb"):
+            os.symlink(self.victim, os.path.join(self.geo, name))
+        code, out = self.update_in_child()
+        self.assertEqual(code, 0, out)
+        self.assertIn("running as uid %d" % self.OTHER_UID, out)
+        self.assertEqual(open(self.victim).read(), "root:secret\n")
+        self.assertEqual(oct(os.stat(self.victim).st_mode & 0o777), "0o600")
+        for name in ("dbip-city-lite.mmdb", "dbip-asn-lite.mmdb", "source.json"):
+            st = os.lstat(os.path.join(self.geo, name))
+            self.assertTrue(stat.S_ISREG(st.st_mode), name)
+            self.assertEqual(st.st_uid, self.OTHER_UID, name)
+        self.assertEqual(rep.Geo(self.geo).lookup("81.2.69.160")["city"], "London")
+
+    def test_metadata_is_sanitised_before_printing(self):
+        port = self.server.server_address[1]
+        geo = tempfile.mkdtemp()
+        saved = (rep.DBIP_URL, rep.VERIFY_PROBES)
+        rep.VERIFY_PROBES = ("81.2.69.160", "1.128.0.0")
+        month = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
+        os.rename(os.path.join(self.srv_dir, "dbip-evilcity-lite-%s.mmdb.gz" % month),
+                  os.path.join(self.srv_dir, "evil-city-%s.gz" % month))
+        try:
+            rep.DBIP_URL = "http://127.0.0.1:%d/evil-{edition}-{month}.gz" % port
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                try:
+                    rep.update_geo(geo, "city", quiet=False)
+                except rep.ReportError:
+                    pass  # the ASN download is missing from this URL pattern
+            self.assertIn("City", buf.getvalue())
+            self.assertNotIn("\x1b", buf.getvalue())
+        finally:
+            rep.DBIP_URL, rep.VERIFY_PROBES = saved
+            os.rename(os.path.join(self.srv_dir, "evil-city-%s.gz" % month),
+                      os.path.join(self.srv_dir, "dbip-evilcity-lite-%s.mmdb.gz" % month))
+
+
+class TarpitTempFileTests(unittest.TestCase):
+    def test_open_new_never_follows_symlinks(self):
+        d = tempfile.mkdtemp()
+        victim = os.path.join(d, "victim")
+        with open(victim, "w") as f:
+            f.write("keep\n")
+        tmp = os.path.join(d, "stats.json.tmp.1")
+        os.symlink(victim, tmp)
+        with limitlessh.open_new(tmp) as f:  # stale entry is removed, not followed
+            f.write("new\n")
+        self.assertEqual(open(victim).read(), "keep\n")
+        self.assertFalse(os.path.islink(tmp))
+        self.assertEqual(open(tmp).read(), "new\n")
 
 
 if __name__ == "__main__":
