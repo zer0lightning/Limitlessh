@@ -1,4 +1,4 @@
-# limitlessh
+# Limitlessh
 
 ![Limitlessh](./assets/banner.jpg)
 Hardened SSH tarpit inspired by [endlessh]. Holds scanners on port 22 with an endless random banner, while the real sshd runs on another port.
