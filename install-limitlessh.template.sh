@@ -2,13 +2,13 @@
 # install-limitlessh.sh - install limitlessh, a hardened SSH tarpit inspired by
 # endlessh (https://github.com/skeeto/endlessh), on Ubuntu.
 #
-# Self-contained: the limitlessh program is embedded at the bottom of this
+# Self-contained: limitlessh and limitlessh-report are embedded in this
 # script. Run with --help for usage.
 
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-VERSION="1.0.1"
+VERSION="1.1.0"
 
 # Defaults (environment variables also work, flags override them)
 PORT="${PORT:-22}"                       # tarpit port
@@ -21,12 +21,24 @@ PER_NET="${PER_NET:-32}"
 MAX_LIFETIME="${MAX_LIFETIME:-0}"        # 0 = hold forever
 SUMMARY_INTERVAL="${SUMMARY_INTERVAL:-600}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
+LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-90}"
+GEO_EDITION="${GEO_EDITION:-city}"       # city | country
+CONN_LOG=1
+GEO=1
+PURGE=0
 MOVE_SSH=1
 ASSUME_YES=0
 ACTION="install"
 
 PY_DIR="/usr/local/lib/limitlessh"
 PY_BIN="$PY_DIR/limitlessh.py"
+REPORT_BIN="$PY_DIR/limitlessh-report.py"
+REPORT_LINK="/usr/local/bin/limitlessh-report"
+GEO_SERVICE_UNIT="/etc/systemd/system/limitlessh-geoupdate.service"
+GEO_TIMER_UNIT="/etc/systemd/system/limitlessh-geoupdate.timer"
+STATE_DIR="/var/lib/limitlessh"
+LOGS_DIR="/var/log/limitlessh"
+GEO_DIR="/var/lib/limitlessh-geo"
 CONF_DIR="/etc/limitlessh"
 CONF="$CONF_DIR/limitlessh.conf"
 SOCKET_UNIT="/etc/systemd/system/limitlessh.socket"
@@ -43,8 +55,9 @@ $SCRIPT_NAME v$VERSION - install limitlessh, a hardened SSH tarpit (inspired by 
 limitlessh holds SSH scanners and bots on an endless fake banner. Compared
 with endlessh it limits connections per IP and per network, drops the oldest
 connection from the busiest network when full (instead of going dead), never
-reads client data, logs a summary instead of a line per connection, and runs
-under systemd with no privileges and no network access of its own.
+reads client data, and runs under systemd with no privileges and no network
+access of its own. It records every connection to a rotated JSON log, and
+limitlessh-report turns that into reports with country, city, ASN and ISP.
 
 Usage:
   sudo $SCRIPT_NAME [options]
@@ -63,15 +76,23 @@ Options:
   -t, --max-lifetime SEC    Drop clients after SEC seconds, 0=never  (default: $MAX_LIFETIME)
       --summary-interval S  Seconds between summary log lines, 0=off (default: $SUMMARY_INTERVAL)
   -v, --log-level LEVEL     debug, info, warning or error            (default: $LOG_LEVEL)
+      --log-retention-days N  Keep connection logs N days, 0=by count  (default: $LOG_RETENTION_DAYS)
+      --no-connection-log   Don't record connections (no reports)
+      --geo-edition E       Geolocation database: city (~250 MB) or
+                            country (~10 MB), plus ASN (~25 MB)      (default: $GEO_EDITION)
+      --no-geo              Don't download geolocation databases
   -y, --yes                 Don't ask for confirmation
       --print-units         Print the config and systemd units that would be
                             installed, then exit (no root needed)
   -u, --uninstall           Remove limitlessh (does not change sshd back)
+      --purge               With --uninstall: also delete logs, stats and
+                            geolocation databases
   -h, --help                Show this help and exit
   -V, --version             Show version and exit
 
 Environment variables PORT, SSH_PORT, DELAY, MAX_LINE, MAX_CLIENTS, PER_IP,
-PER_NET, MAX_LIFETIME, SUMMARY_INTERVAL and LOG_LEVEL set the same defaults.
+PER_NET, MAX_LIFETIME, SUMMARY_INTERVAL, LOG_LEVEL, LOG_RETENTION_DAYS and
+GEO_EDITION set the same defaults.
 
 Examples:
   sudo $SCRIPT_NAME                          # sshd -> 2200, tarpit -> 22
@@ -80,7 +101,10 @@ Examples:
   sudo $SCRIPT_NAME --uninstall
 
 After installing:
-  journalctl -u limitlessh -f               # logs (a summary every 10 min)
+  sudo limitlessh-report                    # report for the last 7 days
+  sudo limitlessh-report --ip 203.0.113.7   # history of one IP
+  sudo limitlessh-report --csv out.csv      # raw records with geolocation
+  journalctl -u limitlessh -f               # service log (a summary every 10 min)
   sudo systemctl kill -s USR1 limitlessh    # log current stats now
   sudo systemctl reload limitlessh          # re-read $CONF
 
@@ -116,6 +140,13 @@ while [[ $# -gt 0 ]]; do
     --summary-interval=*) SUMMARY_INTERVAL="${1#*=}"; shift ;;
     -v|--log-level)     need_arg "$@"; LOG_LEVEL="$2"; shift 2 ;;
     --log-level=*)      LOG_LEVEL="${1#*=}"; shift ;;
+    --log-retention-days) need_arg "$@"; LOG_RETENTION_DAYS="$2"; shift 2 ;;
+    --log-retention-days=*) LOG_RETENTION_DAYS="${1#*=}"; shift ;;
+    --no-connection-log) CONN_LOG=0; shift ;;
+    --geo-edition)      need_arg "$@"; GEO_EDITION="$2"; shift 2 ;;
+    --geo-edition=*)    GEO_EDITION="${1#*=}"; shift ;;
+    --no-geo)           GEO=0; shift ;;
+    --purge)            PURGE=1; shift ;;
     -y|--yes)           ASSUME_YES=1; shift ;;
     --print-units)      ACTION="print"; shift ;;
     -u|--uninstall)     ACTION="uninstall"; shift ;;
@@ -145,6 +176,8 @@ if [[ "$ACTION" != "uninstall" ]]; then
   is_num "$SUMMARY_INTERVAL" || usage_error "invalid --summary-interval '$SUMMARY_INTERVAL'"
   [[ "$LOG_LEVEL" =~ ^(debug|info|warning|error|0|1|2)$ ]] \
     || usage_error "invalid --log-level '$LOG_LEVEL' (debug, info, warning, error)"
+  is_num "$LOG_RETENTION_DAYS" || usage_error "invalid --log-retention-days '$LOG_RETENTION_DAYS'"
+  [[ "$GEO_EDITION" =~ ^(city|country)$ ]] || usage_error "invalid --geo-edition '$GEO_EDITION' (city or country)"
   # limitlessh itself checks ranges (e.g. max-line 3-253) before anything changes
   PORT=$((10#$PORT)); SSH_PORT=$((10#$SSH_PORT)); MAX_CLIENTS=$((10#$MAX_CLIENTS))
 fi
@@ -174,6 +207,16 @@ ipv6-prefix      = 64
 max-lifetime     = $MAX_LIFETIME
 summary-interval = $SUMMARY_INTERVAL
 log-level        = $LOG_LEVEL
+
+# Connection log (JSON lines) and stats, read by limitlessh-report.
+# Comment out log-file to stop recording IP addresses.
+$(if (( CONN_LOG )); then echo "log-file           = $LOGS_DIR/connections.log"; else echo "# log-file         = $LOGS_DIR/connections.log"; fi)
+log-max-size       = 20
+log-max-files      = 50
+log-retention-days = $LOG_RETENTION_DAYS
+log-rate           = 200
+stats-file         = $STATE_DIR/stats.json
+stats-interval     = 60
 EOF
 }
 
@@ -217,6 +260,12 @@ MemoryMax=${MEMORY_MAX_MB}M
 TasksMax=16
 # Under a connection flood, yield CPU to everything else (including sshd)
 CPUWeight=20
+
+# Writable places: logs and stats only (owned by the throwaway user, root can read)
+StateDirectory=limitlessh
+StateDirectoryMode=0700
+LogsDirectory=limitlessh
+LogsDirectoryMode=0700
 
 # Identity: a throwaway user with no capabilities
 DynamicUser=yes
@@ -262,10 +311,81 @@ WantedBy=multi-user.target
 EOF
 }
 
+geo_service_text() {
+  cat <<EOF
+[Unit]
+Description=limitlessh: update geolocation databases (DB-IP Lite, CC BY 4.0)
+Documentation=https://db-ip.com/db/lite.php
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B $REPORT_BIN --update-geo --geo-edition $GEO_EDITION --geo-dir $GEO_DIR --quiet
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=512M
+TasksMax=8
+
+StateDirectory=limitlessh-geo
+StateDirectoryMode=0755
+DynamicUser=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectProc=invisible
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+UMask=0022
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+EOF
+}
+
+geo_timer_text() {
+  cat <<EOF
+[Unit]
+Description=limitlessh: monthly geolocation database update
+
+[Timer]
+OnCalendar=*-*-05 04:00:00
+RandomizedDelaySec=12h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
 write_program() {  # $1 = destination
   cat > "$1" <<'LIMITLESSH_PY_EOF'
 @@LIMITLESSH_PY@@
 LIMITLESSH_PY_EOF
+}
+
+write_report() {  # $1 = destination
+  cat > "$1" <<'LIMITLESSH_REPORT_EOF'
+@@LIMITLESSH_REPORT_PY@@
+LIMITLESSH_REPORT_EOF
 }
 
 check_settings() {  # validate with limitlessh's own rules before changing anything
@@ -277,6 +397,11 @@ check_settings() {  # validate with limitlessh's own rules before changing anyth
     rm -f "$tmp" "$conf"
     exit 2
   fi
+  write_report "$tmp"
+  if ! python3 -I -B "$tmp" --version >/dev/null; then
+    rm -f "$tmp" "$conf"
+    die "embedded limitlessh-report failed to start"
+  fi
   rm -f "$tmp" "$conf"
 }
 
@@ -285,6 +410,10 @@ if [[ "$ACTION" == "print" ]]; then
   echo "# ---- $CONF";         config_text;        echo
   echo "# ---- $SOCKET_UNIT";  socket_unit_text;   echo
   echo "# ---- $SERVICE_UNIT"; service_unit_text
+  if (( GEO )); then
+    echo; echo "# ---- $GEO_SERVICE_UNIT"; geo_service_text
+    echo; echo "# ---- $GEO_TIMER_UNIT"; geo_timer_text
+  fi
   exit 0
 fi
 
@@ -304,13 +433,28 @@ ufw_active() { command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "St
 # Uninstall
 # ---------------------------------------------------------------------------
 if [[ "$ACTION" == "uninstall" ]]; then
-  confirm "Remove limitlessh (units, program, config)?"
+  if (( PURGE )); then
+    confirm "Remove limitlessh AND delete its logs, stats and geolocation databases?"
+  else
+    confirm "Remove limitlessh (units, program, config)? Logs and stats are kept."
+  fi
   OLD_PORT="$(sed -n 's/^ListenStream=\([0-9]*\)$/\1/p' "$SOCKET_UNIT" 2>/dev/null | head -1 || true)"
   log "Stopping and removing limitlessh"
-  systemctl disable --now limitlessh.socket limitlessh.service 2>/dev/null || true
-  rm -f "$SOCKET_UNIT" "$SERVICE_UNIT"
+  systemctl disable --now limitlessh.socket limitlessh.service \
+    limitlessh-geoupdate.timer limitlessh-geoupdate.service 2>/dev/null || true
+  rm -f "$SOCKET_UNIT" "$SERVICE_UNIT" "$GEO_SERVICE_UNIT" "$GEO_TIMER_UNIT"
+  if [[ -L "$REPORT_LINK" ]]; then rm -f "$REPORT_LINK"; fi
   rm -rf "$PY_DIR" "$CONF_DIR"
   systemctl daemon-reload
+  if (( PURGE )); then
+    # DynamicUser keeps the real directories under /var/{lib,log}/private
+    rm -rf "$STATE_DIR" "$LOGS_DIR" "$GEO_DIR" \
+      /var/lib/private/limitlessh /var/log/private/limitlessh /var/lib/private/limitlessh-geo
+    log "Deleted logs, stats and geolocation databases"
+  else
+    echo "Kept: $LOGS_DIR (connection logs), $STATE_DIR (stats), $GEO_DIR (geolocation)."
+    echo "Delete them with: sudo $SCRIPT_NAME --uninstall --purge"
+  fi
   # Leave a port-22 rule alone so restoring sshd to 22 can't lock you out
   if [[ -n "$OLD_PORT" && "$OLD_PORT" != "22" ]] && ufw_active; then
     ufw delete allow "${OLD_PORT}/tcp" >/dev/null 2>&1 || true
@@ -479,6 +623,16 @@ write_program "$PY_TMP"
 chmod 0755 "$PY_TMP"
 mv -f "$PY_TMP" "$PY_BIN"
 
+log "Installing $REPORT_BIN and $REPORT_LINK"
+REPORT_TMP="$(mktemp "$PY_DIR/.limitlessh-report.XXXXXX")"
+write_report "$REPORT_TMP"
+chmod 0755 "$REPORT_TMP"
+mv -f "$REPORT_TMP" "$REPORT_BIN"
+if [[ -e "$REPORT_LINK" && ! -L "$REPORT_LINK" ]]; then
+  die "$REPORT_LINK exists and is not a symlink; refusing to replace it"
+fi
+ln -sfn "$REPORT_BIN" "$REPORT_LINK"
+
 log "Writing $CONF"
 safe_dir "$CONF_DIR"
 [[ -f "$CONF" ]] && cp -a "$CONF" "$CONF.bak"
@@ -489,6 +643,14 @@ log "Installing systemd units"
 socket_unit_text  > "$SOCKET_UNIT"
 service_unit_text > "$SERVICE_UNIT"
 chmod 0644 "$SOCKET_UNIT" "$SERVICE_UNIT"
+if (( GEO )); then
+  geo_service_text > "$GEO_SERVICE_UNIT"
+  geo_timer_text   > "$GEO_TIMER_UNIT"
+  chmod 0644 "$GEO_SERVICE_UNIT" "$GEO_TIMER_UNIT"
+else
+  systemctl disable --now limitlessh-geoupdate.timer 2>/dev/null || true
+  rm -f "$GEO_SERVICE_UNIT" "$GEO_TIMER_UNIT"
+fi
 
 systemctl daemon-reload
 systemctl enable --now limitlessh.socket
@@ -498,6 +660,18 @@ systemctl start limitlessh.service
 if ufw_active; then
   log "Allowing ${PORT}/tcp in ufw"
   ufw allow "${PORT}/tcp" comment 'limitlessh tarpit'
+fi
+
+if (( GEO )); then
+  systemctl enable --now limitlessh-geoupdate.timer >/dev/null 2>&1 || true
+  log "Downloading geolocation databases (DB-IP Lite, $GEO_EDITION + ASN); this can take a few minutes"
+  if systemctl start limitlessh-geoupdate.service; then
+    log "Geolocation databases installed in $GEO_DIR (refreshed monthly)"
+  else
+    echo "WARNING: geolocation download failed; reports will work without it." >&2
+    echo "         Retry later: sudo systemctl start limitlessh-geoupdate.service" >&2
+    echo "         Details:     journalctl -u limitlessh-geoupdate -n 20" >&2
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -518,6 +692,10 @@ echo "  limitlessh tarpit : port ${PORT}"
 echo "  config            : $CONF  (apply with: sudo systemctl reload limitlessh)"
 echo "  logs              : journalctl -u limitlessh -f"
 echo "  stats now         : sudo systemctl kill -s USR1 limitlessh"
+if (( CONN_LOG )); then
+  echo "  report            : sudo limitlessh-report            (see --help)"
+  echo "  connection log    : $LOGS_DIR/connections.log  (kept $LOG_RETENTION_DAYS days)"
+fi
 if [[ -d "$BACKUP_DIR" ]]; then
   echo "  real sshd         : port ${SSH_PORT}  (backup of /etc/ssh in $BACKUP_DIR)"
   echo

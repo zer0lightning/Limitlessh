@@ -15,7 +15,9 @@ What it does differently from endlessh:
   * When full, it drops the oldest connection from the busiest network
     instead of refusing newcomers.
   * Drops clients that stop reading, and optionally clients held too long.
-  * Logs a periodic summary instead of a line per connection.
+  * Logs a periodic summary instead of a line per connection, and can write
+    a rotated, rate-capped JSON log of every connection plus lifetime stats
+    for the limitlessh-report tool.
   * Supports systemd socket activation, so it can run with no privileges and
     no network access of its own.
 
@@ -25,18 +27,25 @@ Python 3.8+ standard library only. Linux recommended.
 import argparse
 import asyncio
 import collections
+import concurrent.futures
+import datetime
+import glob
+import gzip
 import ipaddress
+import json
 import logging
+import math
 import os
 import random
 import resource
+import shutil
 import signal
 import socket
 import string
 import sys
 import time
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 PROG = "limitlessh"
 LOG = logging.getLogger(PROG)
 
@@ -87,6 +96,15 @@ def _log_level(value):
     return v
 
 
+def _path(value):
+    v = str(value).strip()
+    if v == "":
+        return ""
+    if not os.path.isabs(v) or any(c in v for c in "\0\n\r"):
+        raise ValueError("must be an absolute path or empty, got %r" % value)
+    return os.path.normpath(v)
+
+
 def _bind_addr(value):
     v = str(value).strip()
     try:
@@ -126,6 +144,20 @@ OPTIONS = [
      "how many top source addresses to show in each summary"),
     ("log-level", _log_level, "info",
      "debug (one line per connection), info, warning or error"),
+    ("log-file", _path, "",
+     "append one JSON line per connection to this file ('' = off)"),
+    ("log-max-size", _ranged(float, 1.0, 10240.0), 20.0,
+     "rotate the connection log when it reaches this many MiB"),
+    ("log-max-files", _ranged(int, 1, 10000), 20,
+     "rotated, gzip-compressed connection logs to keep"),
+    ("log-retention-days", _ranged(float, 0.0, 36500.0), 90.0,
+     "delete rotated connection logs older than this many days (0 = keep by count only)"),
+    ("log-rate", _ranged(int, 1, 1000000), 200,
+     "maximum connection log lines per second; extra events are counted as suppressed"),
+    ("stats-file", _path, "",
+     "write live and lifetime stats as JSON to this file ('' = off)"),
+    ("stats-interval", _ranged(float, 5.0, 3600.0), 60.0,
+     "seconds between stats file updates"),
 ]
 OPTION_MAP = {name: (conv, default) for name, conv, default, _ in OPTIONS}
 
@@ -275,17 +307,224 @@ def set_log_level(level):
 
 
 # ---------------------------------------------------------------------------
+# Connection log and stats file
+# ---------------------------------------------------------------------------
+
+def iso_utc(ts):
+    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class EventLog(object):
+    """Append-only JSON-lines log of connections.
+
+    Bounded on every axis an attacker could push: lines per second (extra
+    events are counted, not written), file size (rotated), number of rotated
+    files and their age (pruned). Rotated files are gzip-compressed on a
+    single background thread so the event loop never blocks on it.
+    """
+
+    ERROR_BACKOFF = 60.0
+
+    def __init__(self, cfg, loop):
+        self.cfg = cfg
+        self.loop = loop
+        self.path = None
+        self.fh = None
+        self.size = 0
+        self.second = 0
+        self.in_second = 0
+        self.suppressed = 0
+        self.total_suppressed = 0
+        self.retry_at = 0.0
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="logzip")
+
+    # -- file handling ------------------------------------------------------
+
+    def configure(self, cfg):
+        self.cfg = cfg
+        if cfg.log_file != self.path:
+            self.close()
+            self.path = cfg.log_file or None
+            if self.path:
+                self._open()
+                self.pool.submit(self._housekeeping)
+
+    def _open(self):
+        try:
+            self.fh = open(self.path, "a", encoding="utf-8", buffering=65536)
+            self.size = self.fh.tell()
+        except OSError as e:
+            self._failed("cannot open connection log %s: %s" % (self.path, e.strerror or e))
+
+    def _failed(self, message):
+        LOG.error("%s; retrying in %ds", message, self.ERROR_BACKOFF)
+        if self.fh is not None:
+            try:
+                self.fh.close()
+            except OSError:
+                pass
+        self.fh = None
+        self.retry_at = time.monotonic() + self.ERROR_BACKOFF
+
+    def close(self):
+        if self.fh is not None:
+            self._flush_suppressed(force=True)
+            try:
+                self.fh.close()
+            except OSError:
+                pass
+            self.fh = None
+
+    def shutdown(self):
+        self.close()
+        self.pool.shutdown(wait=True)
+
+    # -- writing -------------------------------------------------------------
+
+    def _writable(self):
+        if not self.path:
+            return False
+        if self.fh is None:
+            if time.monotonic() < self.retry_at:
+                return False
+            self._open()
+        return self.fh is not None
+
+    def record(self, data):
+        """Rate-limited write of one event."""
+        if not self.path:
+            return
+        now = int(time.time())
+        if now != self.second:
+            self._flush_suppressed()
+            self.second = now
+            self.in_second = 0
+        if self.in_second >= self.cfg.log_rate:
+            self.suppressed += 1
+            self.total_suppressed += 1
+            return
+        self.in_second += 1
+        self._write(data)
+
+    def _flush_suppressed(self, force=False):
+        if self.suppressed and (force or int(time.time()) != self.second):
+            n, self.suppressed = self.suppressed, 0
+            self._write({"ts": iso_utc(self.second or time.time()), "suppressed": n})
+
+    def _write(self, data):
+        if not self._writable():
+            return
+        line = json.dumps(data, separators=(",", ":"), ensure_ascii=True) + "\n"
+        try:
+            self.fh.write(line)
+            self.size += len(line)
+            if self.size >= self.cfg.log_max_size * 1048576:
+                self._rotate()
+        except OSError as e:
+            self._failed("cannot write connection log %s: %s" % (self.path, e.strerror or e))
+
+    def flush(self):
+        self._flush_suppressed()
+        if self.fh is not None:
+            try:
+                self.fh.flush()
+            except OSError as e:
+                self._failed("cannot write connection log %s: %s" % (self.path, e.strerror or e))
+
+    # -- rotation and pruning -----------------------------------------------
+
+    def _rotated_prefix(self):
+        base = self.path[:-4] if self.path.endswith(".log") else self.path
+        return base + "-"
+
+    def _rotate(self):
+        self.fh.flush()
+        self.fh.close()
+        self.fh = None
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        dest = "%s%s.log" % (self._rotated_prefix(), stamp)
+        n = 1
+        while os.path.exists(dest) or os.path.exists(dest + ".gz"):
+            dest = "%s%s-%d.log" % (self._rotated_prefix(), stamp, n)
+            n += 1
+        os.rename(self.path, dest)
+        self._open()
+        self.pool.submit(self._housekeeping)
+
+    def _housekeeping(self):
+        """Runs on the background thread: compress rotated logs, then prune."""
+        try:
+            prefix = self._rotated_prefix()
+            for raw in sorted(glob.glob(glob.escape(prefix) + "*.log")):
+                tmp = raw + ".gz.tmp"
+                with open(raw, "rb") as src, gzip.open(tmp, "wb", compresslevel=6) as dst:
+                    shutil.copyfileobj(src, dst, 1048576)
+                os.replace(tmp, raw + ".gz")
+                os.unlink(raw)
+            rotated = sorted(glob.glob(glob.escape(prefix) + "*.log.gz"))
+            excess = rotated[:-self.cfg.log_max_files] if len(rotated) > self.cfg.log_max_files else []
+            cutoff = time.time() - self.cfg.log_retention_days * 86400
+            for path in rotated:
+                if path in excess or (self.cfg.log_retention_days > 0 and os.path.getmtime(path) < cutoff):
+                    os.unlink(path)
+        except OSError as e:
+            LOG.warning("connection log housekeeping failed: %s", e)
+
+    def prune_later(self):
+        if self.path:
+            self.pool.submit(self._housekeeping)
+
+
+def _clean_counters(data, keys):
+    """Accept only finite, non-negative numbers from a stats file."""
+    out = dict.fromkeys(keys, 0)
+    if isinstance(data, dict):
+        for key in keys:
+            v = data.get(key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and 0 <= v < 1e18:
+                out[key] = v
+    return out
+
+
+def load_lifetime(path, keys):
+    """Return (counters, since_ts, peak, peak_ts) from a previous stats file."""
+    now = time.time()
+    if not path:
+        return dict.fromkeys(keys, 0), now, 0, now
+    try:
+        with open(path, encoding="utf-8") as f:
+            if os.fstat(f.fileno()).st_size > 1048576:
+                raise ValueError("stats file too large")
+            data = json.load(f)
+        life = data.get("lifetime", {}) if isinstance(data, dict) else {}
+        counters = _clean_counters(life.get("counters"), keys)
+        since = life.get("since_ts")
+        since = since if isinstance(since, (int, float)) and 0 < since <= now else now
+        peak = life.get("peak_active")
+        peak = int(peak) if isinstance(peak, int) and 0 <= peak < 1e9 else 0
+        peak_ts = life.get("peak_ts")
+        peak_ts = peak_ts if isinstance(peak_ts, (int, float)) and 0 < peak_ts <= now else now
+        return counters, since, peak, peak_ts
+    except FileNotFoundError:
+        return dict.fromkeys(keys, 0), now, 0, now
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+        LOG.warning("ignoring unreadable stats file %s: %s", path, e)
+        return dict.fromkeys(keys, 0), now, 0, now
+
+
+# ---------------------------------------------------------------------------
 # The tarpit
 # ---------------------------------------------------------------------------
 
 class Client(object):
-    __slots__ = ("transport", "ip", "net", "start", "timer", "sent", "active")
+    __slots__ = ("transport", "ip", "net", "start", "wall_start", "timer", "sent", "active")
 
     def __init__(self, transport, ip, net, start):
         self.transport = transport
         self.ip = ip
         self.net = net
         self.start = start
+        self.wall_start = time.time()
         self.timer = None
         self.sent = 0
         self.active = True
@@ -324,11 +563,15 @@ class TarpitProtocol(asyncio.Protocol):
 
 class Tarpit(object):
     COUNTERS = ("accepted", "rejected_ip", "rejected_net", "rejected_bad", "evicted",
-                "stalled", "expired", "closed", "wasted", "sent")
+                "stalled", "expired", "shutdown", "closed", "wasted", "sent")
 
-    def __init__(self, cfg, loop):
+    def __init__(self, cfg, loop, events=None):
         self.cfg = cfg
         self.loop = loop
+        self.events = events
+        self.started_ts = time.time()
+        (self.life_base, self.life_since, self.life_peak,
+         self.life_peak_ts) = load_lifetime(cfg.stats_file, self.COUNTERS)
         self.rand = random.Random()
         self.clients = collections.OrderedDict()   # Client -> None, oldest first
         self.by_ip = collections.Counter()
@@ -399,12 +642,14 @@ class Tarpit(object):
         if self.by_ip[ip] >= cfg.per_ip:
             self.count("rejected_ip")
             LOG.debug("reject %s: per-ip limit (%d)", ip, cfg.per_ip)
+            self._event(time.time(), ip, 0.0, 0, "rejected-ip")
             transport.abort()
             return None
         members = self.by_net.get(net)
         if members is not None and len(members) >= cfg.per_net:
             self.count("rejected_net")
             LOG.debug("reject %s: per-net limit (%d) for %s", ip, cfg.per_net, net)
+            self._event(time.time(), ip, 0.0, 0, "rejected-net")
             transport.abort()
             return None
         while len(self.clients) >= cfg.max_clients:
@@ -426,6 +671,9 @@ class Tarpit(object):
         self.count("accepted")
         if len(self.clients) > self.peak:
             self.peak = len(self.clients)
+        if len(self.clients) > self.life_peak:
+            self.life_peak = len(self.clients)
+            self.life_peak_ts = time.time()
         LOG.debug("accept %s (active=%d)", ip, len(self.clients))
 
         # First line arrives quickly so the client commits to waiting.
@@ -490,7 +738,13 @@ class Tarpit(object):
         self.count("wasted", held)
         self.count("sent", client.sent)
         LOG.debug("close %s: %s after %s, %d bytes", client.ip, reason, fmt_duration(held), client.sent)
+        self._event(client.wall_start, client.ip, held, client.sent, reason)
         return True
+
+    def _event(self, ts, ip, held, sent, result):
+        if self.events is not None:
+            self.events.record({"ts": iso_utc(ts), "ip": ip, "dur": round(held, 1),
+                                "bytes": sent, "result": result})
 
     # -- sending -------------------------------------------------------------
 
@@ -576,8 +830,50 @@ class Tarpit(object):
     def shutdown(self):
         for client in list(self.clients):
             if client.active:
-                self.release(client, "closed")
+                self.release(client, "shutdown")
                 client.transport.abort()
+
+    def stats_snapshot(self):
+        now = self.loop.time()
+        wall = time.time()
+        lifetime = {k: self.life_base[k] + self.totals[k] for k in self.COUNTERS}
+        active_time = self.active_time(now)
+        return {
+            "version": 1,
+            "program": "limitlessh %s" % VERSION,
+            "updated": iso_utc(wall), "updated_ts": round(wall, 3),
+            "started": iso_utc(self.started_ts), "started_ts": round(self.started_ts, 3),
+            "active": len(self.clients),
+            "networks": len(self.by_net),
+            "max_clients": self.cfg.max_clients,
+            "active_time": round(active_time, 1),
+            "session": {"counters": {k: (round(v, 1) if isinstance(v, float) else v)
+                                     for k, v in self.totals.items()}},
+            "lifetime": {
+                "since": iso_utc(self.life_since), "since_ts": round(self.life_since, 3),
+                "peak_active": self.life_peak,
+                "peak": iso_utc(self.life_peak_ts), "peak_ts": round(self.life_peak_ts, 3),
+                "counters": {k: (round(v, 1) if isinstance(v, float) else v) for k, v in lifetime.items()},
+                "log_suppressed": self.events.total_suppressed if self.events else 0,
+            },
+        }
+
+    def write_stats(self):
+        path = self.cfg.stats_file
+        if not path:
+            return
+        tmp = "%s.tmp.%d" % (path, os.getpid())
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.stats_snapshot(), f, indent=1, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp, path)
+        except OSError as e:
+            LOG.warning("cannot write stats file %s: %s", path, e.strerror or e)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -657,7 +953,9 @@ def fit_fd_limit(cfg):
 
 async def serve(cfg, sock, activated, config_path, cli_values):
     loop = asyncio.get_running_loop()
-    tarpit = Tarpit(cfg, loop)
+    events = EventLog(cfg, loop)
+    events.configure(cfg)
+    tarpit = Tarpit(cfg, loop, events)
     server = await loop.create_server(lambda: TarpitProtocol(tarpit), sock=sock, backlog=4096)
     name = sock.getsockname()
     LOG.info("limitlessh %s listening on [%s]:%d%s (max-clients=%d per-ip=%d per-net=%d delay=%gs)",
@@ -665,9 +963,29 @@ async def serve(cfg, sock, activated, config_path, cli_values):
              cfg.max_clients, cfg.per_ip, cfg.per_net, cfg.delay)
     if os.geteuid() == 0 and not activated:
         LOG.warning("running as root; prefer the systemd units, which run it unprivileged")
+    if cfg.log_file:
+        LOG.info("connection log: %s (max %d lines/s)", cfg.log_file, cfg.log_rate)
+    events.record({"ts": iso_utc(time.time()), "event": "start", "version": VERSION})
 
     stop = loop.create_future()
     summary_timer = [None]
+    timers = {}
+
+    def every(name, interval_fn, action):
+        """Run action every interval_fn() seconds; re-read interval each time."""
+        def tick():
+            try:
+                action()
+            finally:
+                timers[name] = loop.call_later(interval_fn(), tick)
+        if name in timers:
+            timers[name].cancel()
+        timers[name] = loop.call_later(interval_fn(), tick)
+
+    every("flush", lambda: 1.0, events.flush)
+    every("stats", lambda: tarpit.cfg.stats_interval, tarpit.write_stats)
+    every("prune", lambda: 3600.0, events.prune_later)
+    tarpit.write_stats()
 
     def schedule_summary():
         if summary_timer[0] is not None:
@@ -696,9 +1014,12 @@ async def serve(cfg, sock, activated, config_path, cli_values):
         new.port, new.bind = cfg.port, cfg.bind
         fit_fd_limit(new)
         tarpit.cfg = new
+        events.configure(new)
         set_log_level(new.log_level)
         tarpit.enforce_limits()
         schedule_summary()
+        every("stats", lambda: tarpit.cfg.stats_interval, tarpit.write_stats)
+        tarpit.write_stats()
         LOG.info("reloaded %s (max-clients=%d per-ip=%d per-net=%d delay=%gs)",
                  config_path, new.max_clients, new.per_ip, new.per_net, new.delay)
 
@@ -710,16 +1031,26 @@ async def serve(cfg, sock, activated, config_path, cli_values):
     loop.add_signal_handler(signal.SIGTERM, on_stop, "SIGTERM")
     loop.add_signal_handler(signal.SIGINT, on_stop, "SIGINT")
     loop.add_signal_handler(signal.SIGHUP, on_reload)
-    loop.add_signal_handler(signal.SIGUSR1, lambda: tarpit.summary(reset=False))
+    def on_usr1():
+        tarpit.summary(reset=False)
+        tarpit.write_stats()
+        events.flush()
+
+    loop.add_signal_handler(signal.SIGUSR1, on_usr1)
     schedule_summary()
 
     try:
         await stop
     finally:
+        for handle in timers.values():
+            handle.cancel()
         server.close()
         tarpit.shutdown()
         await server.wait_closed()
         tarpit.summary(reset=False)
+        tarpit.write_stats()
+        events.record({"ts": iso_utc(time.time()), "event": "stop", "version": VERSION})
+        events.shutdown()
 
 
 def main(argv=None):
@@ -731,7 +1062,7 @@ def main(argv=None):
         return 2
     if args.check_config:
         for name, value in cfg.items():
-            print("%-17s %s" % (name, value))
+            print("%-19s %s" % (name, value))
         return 0
 
     setup_logging(cfg.log_level)
